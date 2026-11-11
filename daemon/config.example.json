@@ -1,0 +1,30 @@
+{
+  "wordpress": {
+    "api_url": "https://nghesachxua.com/wp-json/wp-opt-agents/v1",
+    "username": "admin",
+    "app_password": "your-app-password-here",
+    "site_url": "https://nghesachxua.com"
+  },
+  "blogger": {
+    "blog_id": "your-blog-id",
+    "token": "your-blogger-oauth-token",
+    "base_url": "https://www.blogger.com/api"
+  },
+  "chrome": {
+    "chrome_path": null,
+    "user_data_dir": null,
+    "headless": true
+  },
+  "media": {
+    "max_width": 1200,
+    "max_height": 800,
+    "quality": 85,
+    "upload_timeout": 30
+  },
+  "logging": {
+    "level": "info",
+    "file": null,
+    "max_size_mb": 10,
+    "max_files": 5
+  }
+}

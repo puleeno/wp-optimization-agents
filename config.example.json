@@ -1,0 +1,30 @@
+{
+  "wordpress": {
+    "api_url": "https://example.com/wp-json/wp/v2",
+    "username": "wp_user",
+    "app_password": "xxxx xxxx xxxx xxxx xxxx xxxx",
+    "site_url": "https://example.com"
+  },
+  "blogger": {
+    "blog_id": "1234567890123456789",
+    "token": "oauth_or_access_token",
+    "base_url": "https://www.blogger.com/api"
+  },
+  "chrome": {
+    "chrome_path": null,
+    "user_data_dir": null,
+    "headless": true
+  },
+  "media": {
+    "max_width": 1200,
+    "max_height": 800,
+    "quality": 85,
+    "upload_timeout": 30
+  },
+  "logging": {
+    "level": "info",
+    "file": null,
+    "max_size_mb": 10,
+    "max_files": 5
+  }
+}
