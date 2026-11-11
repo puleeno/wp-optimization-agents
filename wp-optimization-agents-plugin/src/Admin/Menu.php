@@ -2,6 +2,8 @@
 
 namespace Puleeno\WPOptAgents\Admin;
 
+use Puleeno\WPOptAgents\Admin\Pages\Renderer;
+
 class Menu
 {
     private Renderer $renderer;
