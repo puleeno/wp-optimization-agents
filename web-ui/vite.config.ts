@@ -10,12 +10,14 @@ export default defineConfig({
       '@': path.resolve(__dirname, '.'),
     },
   },
+  build: {
+    outDir: 'dist',
+    emptyOutDir: true,
+  },
   server: {
-    port: 2095,
     host: '0.0.0.0',
   },
   preview: {
-    port: 2095,
     host: '0.0.0.0',
   },
 });

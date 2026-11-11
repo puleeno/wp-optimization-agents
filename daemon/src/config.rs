@@ -1,6 +1,5 @@
-// Configuration handling
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -50,18 +49,18 @@ pub struct LoggingConfig {
 }
 
 impl Config {
-    pub fn load(path: &str) -> Result<Self, Error> {
+    pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::ConfigError(format!("Failed to read config: {}", e)))?;
-        
-        let mut config: Config = serde_json::from_str(&content)
+
+        let config: Config = serde_json::from_str(&content)
             .map_err(|e| Error::ConfigError(format!("Failed to parse config: {}", e)))?;
-        
+
         config.validate()?;
         Ok(config)
     }
-    
-    fn validate(&self) -> Result<(), Error> {
+
+    pub fn validate(&self) -> Result<()> {
         if self.wordpress.api_url.is_empty() {
             return Err(Error::ConfigError("WordPress API URL is required".to_string()));
         }
@@ -69,7 +68,9 @@ impl Config {
             return Err(Error::ConfigError("WordPress username is required".to_string()));
         }
         if self.wordpress.app_password.is_empty() {
-            return Err(Error::ConfigError("WordPress app password is required".to_string()));
+            return Err(Error::ConfigError(
+                "WordPress app password is required".to_string(),
+            ));
         }
         if self.blogger.blog_id.is_empty() {
             return Err(Error::ConfigError("Blogger blog ID is required".to_string()));

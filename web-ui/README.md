@@ -1,8 +1,13 @@
 # WP Optimization Agents - Web UI
 
-Dashboard UI for monitoring WordPress-to-Blogger media offload, daemon status, performance audits, and configuration.
+Dashboard frontend (SPA) for monitoring WordPress-to-Blogger media offload, daemon status, performance audits, and configuration.
 
 Based on the reference implementation in `/Users/puleeno/Downloads/wp-optimization-agents---blogger-offload-&-daily-performance-dashboard`.
+
+## Integration
+- **Rust daemon owns port `2095`** and serves this UI as static assets.
+- Build output: `dist/` (bundle) — Rust should serve `dist/index.html` and bundled assets from there.
+- Vite dev/preview ports are not bound to `2095`.
 
 ## Stack
 - React 19 + TypeScript
@@ -10,20 +15,19 @@ Based on the reference implementation in `/Users/puleeno/Downloads/wp-optimizati
 - Tailwind CSS v4
 - lucide-react
 
-## Run
+## Develop
 ```bash
 cd agents/web-ui
 npm install
 npm run dev
 ```
+Use the Vite dev server URL shown in terminal for local UI development.
 
-Dev server: `http://localhost:2095` (configured in `vite.config.ts` and scripts).
-
-## Build
+## Build (for Rust)
 ```bash
 npm run build
-npm run preview
 ```
+Produces `dist/` for embedding/serving by the Rust daemon.
 
 ## Structure
 - `src/App.tsx` - app shell, state, handlers
@@ -35,5 +39,4 @@ npm run preview
 
 ## Notes
 - Current implementation uses local/mock state for metrics, logs, posts, audits, and config.
-- Integration with Rust daemon/Python orchestrator APIs can replace mock handlers/data when endpoints are available.
-- `.env.example` documents intended backend/monitoring settings.
+- When Rust APIs are available, replace mock handlers/data with real endpoints (served on `:2095` by daemon).
