@@ -1,0 +1,6 @@
+{
+  "name": "WP Optimization Agents - Blogger Offload & Daily Performance Dashboard",
+  "description": "High-performance SPA dashboard for WordPress Optimization Agents featuring Rust daemon controls, Blogger image offload transformer, automated daily speed audits, and interactive Core Web Vitals telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

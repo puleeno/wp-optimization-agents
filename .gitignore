@@ -1,1 +1,6 @@
 target
+cargo.lock
+*.so
+*.dll
+*.dylib
+Cargo.lock
