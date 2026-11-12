@@ -45,8 +45,8 @@ class Menu
 
         add_submenu_page(
             'wp-opt-agents',
-            'Daily Audit',
-            'Daily Audit',
+            'WP ↔ Blogger Links',
+            'WP ↔ Blogger',
             'manage_options',
             'wp-opt-agents-audit',
             [$this->renderer, 'render_daily_audit']

@@ -225,6 +225,10 @@ class OffloadService implements OffloadServiceInterface
 
     public function maybe_redirect_old_url(): void
     {
+        $settings = $this->settingsRepository->get_all();
+        if (isset($settings['enable_old_url_redirect_301']) && !$settings['enable_old_url_redirect_301']) {
+            return;
+        }
         if (is_admin() || (defined('REST_REQUEST') && REST_REQUEST) || wp_doing_ajax()) {
             return;
         }
@@ -273,6 +277,44 @@ class OffloadService implements OffloadServiceInterface
             return true;
         }
         return false;
+    }
+
+    public function link_blogger_post(int $post_id, array $data): bool
+    {
+        if ($post_id <= 0) {
+            return false;
+        }
+        $map = [
+            'blogger_post_id' => '_wpoa_blogger_post_id',
+            'blogger_post_url' => '_wpoa_blogger_post_url',
+            'blogger_album_url' => '_wpoa_blogger_album_url',
+            'blogger_blog_id' => '_wpoa_blogger_blog_id',
+        ];
+        $ok = true;
+        foreach ($map as $key => $meta_key) {
+            if (!array_key_exists($key, $data)) {
+                continue;
+            }
+            $val = is_scalar($data[$key]) ? (string)$data[$key] : '';
+            if ($val === '') {
+                continue;
+            }
+            $ok = (bool)update_post_meta($post_id, $meta_key, sanitize_text_field($val)) || $ok;
+        }
+        update_post_meta($post_id, '_wpoa_blogger_linked_at', current_time('mysql'));
+        return $ok;
+    }
+
+    public function get_blogger_post_link(int $post_id): array
+    {
+        return [
+            'post_id' => $post_id,
+            'blogger_post_id' => (string)get_post_meta($post_id, '_wpoa_blogger_post_id', true),
+            'blogger_post_url' => (string)get_post_meta($post_id, '_wpoa_blogger_post_url', true),
+            'blogger_album_url' => (string)get_post_meta($post_id, '_wpoa_blogger_album_url', true),
+            'blogger_blog_id' => (string)get_post_meta($post_id, '_wpoa_blogger_blog_id', true),
+            'linked_at' => (string)get_post_meta($post_id, '_wpoa_blogger_linked_at', true),
+        ];
     }
 
     private function resolve_local_image_meta(string $origin_url, array $image): array

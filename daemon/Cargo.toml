@@ -1,6 +1,6 @@
 [package]
 name = "wp-offload-daemon"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -12,17 +12,25 @@ name = "wp-offload-daemon"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "time", "fs", "signal", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
-reqwest = { version = "0.12", features = ["json"] }
 url = "2.5"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenv = "0.15"
+mysql_async = "0.34"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+regex = "1.10"
+chrono = { version = "0.4", features = ["serde"] }
 
 [profile.release]
 lto = true

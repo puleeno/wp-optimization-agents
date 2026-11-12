@@ -1,109 +1,78 @@
 # WP Optimization Agents Plugin
 
-WordPress plugin providing REST API endpoints for the WP Optimization Agents daemon to offload images to Blogger CDN and optimize WordPress performance.
+WordPress plugin companion for the `wp-offload-daemon` agent that offloads post images to Blogger via the **Blogger web UI (Chrome automation)** — no Google/Blogger API or OAuth tokens. The Rust daemon reads the WordPress DB directly, manages offload mappings, replaces image URLs in the DB, and records WP↔Blogger post links; this plugin provides compatible DB schema, 301 redirects for replaced URLs, admin settings, and optional compatibility REST endpoints.
 
-## Features
+## Architecture (current)
 
-- **REST API** - Secure endpoints for daemon communication
-- **Image Offload Tracking** - Database tracking of offloaded images with status
-- **Post Content Replacement** - Automatic URL replacement in post content
-- **Settings Management** - Comprehensive admin UI for configuration
-- **Daily Audit Integration** - Support for automated Lighthouse audits
+- **Upload path:** Chrome browser automation against Blogger composer (CDP), not Google/Blogger API.
+- **1 WP post = 1 Blogger post/album:** all pending images for a WP post are uploaded to a single Blogger post; the link is stored on the WP post.
+- **DB is the source of truth:** daemon connects to WP MySQL (`{$prefix}wp_opt_agents_images`) to track origin/blogger URLs, attachment/post IDs, status, and redirect state.
+- **URL replacement:** daemon rewrites old image URLs to Blogger URLs in post content (with backup meta) and marks mappings replaced with `redirect_active=1`.
+- **Old URL handling:** plugin serves `301` redirects from original image URLs to Blogger URLs when `redirect_active` mappings exist (and redirect is enabled).
+- **Daemon/UI:** Rust daemon (`wp-offload-daemon`) serves the dashboard UI and API on port `2095` (configurable).
 
 ## Installation
 
-1. Place plugin in `wp-content/plugins/wp-optimization-agents`
-2. Run `composer install` in plugin directory
-3. Activate plugin in WordPress admin
-4. Configure settings at **WP Opt Agents > Settings**
+1. Place plugin in `wp-content/plugins/wp-optimization-agents`.
+2. Run `composer install` in the plugin directory (if dependencies are used).
+3. Activate plugin in WordPress admin (creates/upgrades tables via `dbDelta`).
+4. Configure at **WP Opt Agents > Settings**.
 
-## API Endpoints
+On activation/upgrade (DB version `2.0.0`) the plugin ensures:
 
-All endpoints require `Authorization: Bearer <token>` header.
+- `{$prefix}wp_opt_agents_images` — image offload mappings (`origin_url`, `origin_url_hash`, `blogger_image_url`, `wp_post_id`, `wp_attachment_id`, status `pending|uploading|uploaded|replacing|replaced|failed`, `redirect_active`, timestamps/metadata).
+- `{$prefix}wp_opt_agents_jobs` — job tracking.
+
+WP↔Blogger post link is stored as post meta on the WP post: `_wpoa_blogger_post_id`, `_wpoa_blogger_post_url`, `_wpoa_blogger_album_url`, `_wpoa_blogger_blog_id`, `_wpoa_blogger_linked_at`.
+
+## Settings
+
+### Blogger / Chrome web UI
+- **Blogger Blog ID** — target blog for uploads.
+- **Upload mode** — Chrome web UI (no API).
+- **Chrome executable / user data dir / profile directory / headless** — used by daemon/browser automation.
+
+### Agent / Offload
+- **Daemon host/port** (default `127.0.0.1:2095`), poll interval.
+- **Replace in DB** after upload, **backup before replace**.
+- **Enable old URL 301 redirect** to Blogger URL (served by plugin from mapping table).
+- **Daemon API token** — Bearer token for compatibility REST endpoints.
+
+### Daily Audit (optional)
+- Enable/configure Lighthouse audit targets/schedule/thresholds and notifications if used by the agent stack.
+
+## Compatibility REST API
+
+Optional endpoints for daemon/plugin compatibility (Bearer `Authorization: Bearer <daemon_api_token>`):
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/wp-opt-agents/v1/config` | Get plugin configuration for daemon |
-| POST | `/wp-opt-agents/v1/posts/{id}/scan` | Scan post for local images |
-| GET | `/wp-opt-agents/v1/posts/{id}/images` | Get offload status for post images |
-| POST | `/wp-opt-agents/v1/images` | Register images for offload |
-| POST | `/wp-opt-agents/v1/images/{id}/sync` | Mark image as synced with Blogger URL |
-| POST | `/wp-opt-agents/v1/images/{id}/fail` | Mark image as failed |
+| GET | `/wp-opt-agents/v1/config` | Plugin/agent configuration |
+| POST | `/wp-opt-agents/v1/posts/{id}/scan` | Scan/register post images |
+| GET | `/wp-opt-agents/v1/posts/{id}/images` | List post image mappings |
+| GET | `/wp-opt-agents/v1/posts/{id}/status` | Post offload status |
+| POST | `/wp-opt-agents/v1/posts/{id}/link-blogger` | Save WP↔Blogger post link |
+| POST | `/wp-opt-agents/v1/images/register` | Register image mapping (`/images` alias) |
+| POST | `/wp-opt-agents/v1/images/{id}/uploaded` | Mark image uploaded |
+| POST | `/wp-opt-agents/v1/images/{id}/replaced` | Mark image replaced (`redirect_active`) |
+| POST | `/wp-opt-agents/v1/images/{id}/fail` | Mark image failed (`/sync` legacy alias supported) |
 | POST | `/wp-opt-agents/v1/posts/{id}/replace-content` | Replace image URLs in post content |
-| GET | `/wp-opt-agents/v1/posts/{id}/status` | Get post offload status |
-| GET | `/wp-opt-agents/v1/stats` | Get global offload statistics |
+| GET | `/wp-opt-agents/v1/stats` | Offload statistics |
 
-## Configuration
+> Note: the primary offload flow is driven by the Rust daemon via direct DB access and Chrome automation; REST routes are for compatibility/integration.
 
-Settings available in admin panel:
+## Redirect behavior
 
-### Blogger Configuration
-- **Blog ID** - Your Blogger blog ID
-- **Album Name** - Album to store offloaded images
-- **Auth Type** - OAuth 2.0 or Service Account
-- **CDN Domain Override** - Custom CDN domain (optional)
-
-### Media Offload Settings
-- **Auto WebP Conversion** - Enable automatic WebP
-- **Default Quality** - Image quality (1-100)
-- **Sync Chunk Size** - Images per batch
-- **Replace Post Content** - Auto-replace URLs after offload
-- **Backup Before Rewrite** - Create backup before changes
-
-### Daemon Settings
-- **Port** - Daemon HTTP port (default 2095)
-- **Log Level** - debug/info/warn/error
-- **Worker Threads** - Tokio worker threads
-- **Poll Interval** - Daemon poll interval (seconds)
-- **Auto Retry Limit** - Max retries for failed images
-- **API Token** - Bearer token for daemon auth
-
-### Daily Audit
-- **Enable Daily Audit** - Run automated Lighthouse audits
-- **Cron Schedule** - Cron expression (default 03:00 UTC)
-- **Target URLs** - URLs to audit (one per line)
-- **Slack Webhook** - Notification webhook
-- **Alert LCP Threshold** - Alert if LCP exceeds (ms)
-
-## Architecture
-
-### Design Patterns
-- **Repository Pattern** - Data access abstraction (`ImageRepository`, `SettingsRepository`)
-- **Service Layer** - Business logic encapsulation (`OffloadService`, `SettingsService`)
-- **Dependency Injection** - Interfaces for all dependencies
-- **Factory/Service Locator** - `Plugin` class manages service instances
-- **Single Responsibility** - Each class has one purpose
-
-### Database Schema
-Table: `wp_wp_opt_agents_images`
-- Tracks each image offload operation
-- Status: pending → processing → synced/failed
-- Stores Blogger URL, transformed params, metadata
+When a request path matches an `origin_url` with an active replaced mapping (`replaced` + `redirect_active=1`), the plugin issues a `301` redirect to the stored `blogger_image_url`. Disable via the **Enable old URL 301 redirect** setting.
 
 ## Development
 
 ```bash
-# Install dependencies
 composer install
-
-# Run tests
 composer test
-
-# Code style check
 composer cs
-
-# Auto-fix code style
 composer cbf
 ```
-
-## Daemon Integration
-
-The Rust daemon should:
-1. Call `GET /config` on startup to get settings
-2. Use `POST /posts/{id}/scan` to find images
-3. Call `POST /images` to register images
-4. Process images and call `POST /images/{id}/sync` or `/fail`
-5. Call `POST /posts/{id}/replace-content` to update post
 
 ## License
 
