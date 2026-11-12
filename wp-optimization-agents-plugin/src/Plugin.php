@@ -8,7 +8,9 @@ use Puleeno\WPOptAgents\Admin\Pages\Renderer;
 use Puleeno\WPOptAgents\Admin\Settings;
 use Puleeno\WPOptAgents\Contracts\SettingsRepositoryInterface;
 use Puleeno\WPOptAgents\Database\Schema;
+use Puleeno\WPOptAgents\Repository\ImageRepository;
 use Puleeno\WPOptAgents\Repository\SettingsRepository;
+use Puleeno\WPOptAgents\Service\OffloadService;
 use Puleeno\WPOptAgents\Service\SettingsService;
 use Puleeno\WPOptAgents\Api\RestApi;
 
@@ -39,6 +41,7 @@ class Plugin
         $this->booted = true;
 
         add_action('admin_init', [Schema::class, 'maybe_upgrade']);
+        add_action('template_redirect', [$this->offloadService(), 'maybe_redirect_old_url'], 1);
 
         if (is_admin()) {
             $this->menu()->register();
@@ -71,10 +74,24 @@ class Plugin
         });
     }
 
+    public function imageRepository(): ImageRepository
+    {
+        return $this->make('image_repository', function () {
+            return new ImageRepository();
+        });
+    }
+
+    public function offloadService(): OffloadService
+    {
+        return $this->make('offload_service', function (Plugin $plugin) {
+            return new OffloadService($plugin->imageRepository(), $plugin->settingsRepository());
+        });
+    }
+
     public function restApi(): RestApi
     {
         return $this->make('rest_api', function (Plugin $plugin) {
-            return new RestApi($plugin->settingsService());
+            return new RestApi($plugin->settingsService(), $plugin->offloadService());
         });
     }
 
