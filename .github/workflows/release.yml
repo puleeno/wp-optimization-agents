@@ -1,0 +1,270 @@
+name: Build Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name (e.g., v0.2.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
+
+jobs:
+  build-linux:
+    name: Build Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ../daemon/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev \
+            libmysqlclient-dev \
+            clang \
+            lld
+
+      - name: Build release
+        working-directory: ../daemon
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Strip binary
+        run: strip ../daemon/target/x86_64-unknown-linux-gnu/release/wp-offload-daemon
+
+      - name: Verify binary
+        run: |
+          file ../daemon/target/x86_64-unknown-linux-gnu/release/wp-offload-daemon
+          ../daemon/target/x86_64-unknown-linux-gnu/release/wp-offload-daemon --help 2>&1 | head -5 || true
+
+      - name: Create release archive
+        run: |
+          mkdir -p dist
+          cp ../daemon/target/x86_64-unknown-linux-gnu/release/wp-offload-daemon dist/
+          cp ../daemon/linux/wp-offload-daemon.service dist/
+          cp ../daemon/install.sh dist/
+          tar -czf wp-offload-daemon-linux-x86_64.tar.gz -C dist .
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp-offload-daemon-linux-x86_64
+          path: wp-offload-daemon-linux-x86_64.tar.gz
+          retention-days: 30
+
+  build-linux-musl:
+    name: Build Linux (x86_64-musl, static)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-musl
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ../daemon/target/
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-musl-
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config libssl-dev
+
+      - name: Configure cargo for static linking
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [target.x86_64-unknown-linux-musl]
+          linker = "x86_64-linux-musl-gcc"
+          rustflags = ["-C", "target-feature=+crt-static"]
+          EOF
+
+- name: Build release (musl)
+        working-directory: ../daemon
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v2 -C link-arg=-s"
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Verify binary
+        run: |
+          file ../daemon/target/x86_64-unknown-linux-musl/release/wp-offload-daemon
+          ldd ../daemon/target/x86_64-unknown-linux-musl/release/wp-offload-daemon || true
+
+      - name: Create release archive
+        run: |
+          mkdir -p dist
+          cp ../daemon/target/x86_64-unknown-linux-musl/release/wp-offload-daemon dist/wp-offload-daemon
+          cp ../daemon/linux/wp-offload-daemon.service dist/
+          cp ../daemon/install.sh dist/
+          tar -czf wp-offload-daemon-linux-x86_64-musl.tar.gz -C dist .
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp-offload-daemon-linux-x86_64-musl
+          path: wp-offload-daemon-linux-x86_64-musl.tar.gz
+          retention-days: 30
+
+  build-macos:
+    name: Build macOS (x86_64 + arm64 universal)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-apple-darwin
+        env:
+          RUSTFLAGS: "-C target-cpu=nehalem"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ../daemon/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release (x86_64)
+        working-directory: ../daemon
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Install arm64 target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build release (arm64)
+        working-directory: ../daemon
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          lipo -create \
+            ../daemon/target/x86_64-apple-darwin/release/wp-offload-daemon \
+            ../daemon/target/aarch64-apple-darwin/release/wp-offload-daemon \
+            -output ../daemon/target/universal-apple-darwin/release/wp-offload-daemon
+
+      - name: Verify universal binary
+        run: |
+          file ../daemon/target/universal-apple-darwin/release/wp-offload-daemon
+          ../daemon/target/universal-apple-darwin/release/wp-offload-daemon --help 2>&1 | head -5 || true
+
+      - name: Create release archive
+        run: |
+          mkdir -p dist
+          cp ../daemon/target/universal-apple-darwin/release/wp-offload-daemon dist/
+          cp ../daemon/macos/com.puleeno.wp-offload-daemon.plist dist/
+          cp ../daemon/install.sh dist/
+          tar -czf wp-offload-daemon-macos-universal.tar.gz -C dist .
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp-offload-daemon-macos-universal
+          path: wp-offload-daemon-macos-universal.tar.gz
+          retention-days: 30
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-linux, build-linux-musl, build-macos]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: WP Offload Daemon ${{ github.ref_name }}
+          body: |
+            ## WP Offload Daemon ${{ github.ref_name }}
+
+            Pre-built binaries for WordPress → Blogger image offload via Chrome Web UI.
+
+            ### Assets
+            - `wp-offload-daemon-linux-x86_64.tar.gz` — Linux glibc (x86_64)
+            - `wp-offload-daemon-linux-x86_64-musl.tar.gz` — Linux musl static (x86_64, no dependencies)
+            - `wp-offload-daemon-macos-universal.tar.gz` — macOS Universal (Intel + Apple Silicon)
+
+            ### Install (Linux)
+            ```bash
+            tar -xzf wp-offload-daemon-linux-x86_64.tar.gz
+            sudo ./install.sh install
+            ```
+
+            ### Install (macOS)
+            ```bash
+            tar -xzf wp-offload-daemon-macos-universal.tar.gz
+            sudo ./install.sh install
+            ```
+
+            See [SETUP.md](https://github.com/puleeno/nghesachxua.com/blob/main/agents/SETUP.md) for full configuration guide.
+          files: |
+            artifacts/wp-offload-daemon-linux-x86_64.tar.gz
+            artifacts/wp-offload-daemon-linux-x86_64-musl.tar.gz
+            artifacts/wp-offload-daemon-macos-universal.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

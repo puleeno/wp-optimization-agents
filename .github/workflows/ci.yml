@@ -1,0 +1,89 @@
+name: CI - Build & Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '../daemon/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - '../daemon/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Cargo Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ../daemon/target/
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('../daemon/Cargo.lock') }}
+      - name: Check
+        working-directory: ../daemon
+        run: cargo check --locked
+
+  test:
+    name: Cargo Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ../daemon/target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('../daemon/Cargo.lock') }}
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libmysqlclient-dev
+      - name: Test
+        working-directory: ../daemon
+        run: cargo test --locked
+
+  build:
+    name: Build Release (Linux x86_64)
+    runs-on: ubuntu-latest
+    needs: [check, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-unknown-linux-gnu
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ../daemon/target/
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('../daemon/Cargo.lock') }}
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libmysqlclient-dev clang lld
+      - name: Build
+        working-directory: ../daemon
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Verify
+        run: |
+          file ../daemon/target/x86_64-unknown-linux-gnu/release/wp-offload-daemon
+          ../daemon/target/x86_64-unknown-linux-gnu/release/wp-offload-daemon --help 2>&1 | head -3 || true
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp-offload-daemon-linux-x86_64
+          path: ../daemon/target/x86_64-unknown-linux-gnu/release/wp-offload-daemon
+          retention-days: 7
