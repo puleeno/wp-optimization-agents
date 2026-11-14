@@ -1,0 +1,40 @@
+{
+  "database": {
+    "host": "localhost",
+    "port": 3306,
+    "user": "root",
+    "password": "root",
+    "name": "nghesachxua",
+    "table_prefix": "nsxu_"
+  },
+  "site": {
+    "url": "https://nghesachxua.localhost",
+    "uploads_dir": "/Users/puleeno/Projects/nghesachxua.com/wp-content/uploads"
+  },
+  "blogger": {
+    "blog_id": "YOUR_BLOGGER_BLOG_ID_HERE",
+    "upload_via": "chrome_web_ui",
+    "one_wp_post_per_blogger_post": true
+  },
+  "chrome": {
+    "executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "user_data_dir": "/Users/puleeno/Library/Application Support/Google/Chrome",
+    "profile_directory": "Default",
+    "headless": false,
+    "remote_debugging_port": 9222,
+    "launch_timeout_secs": 30
+  },
+  "agent": {
+    "host": "127.0.0.1",
+    "port": 2095,
+    "poll_interval_secs": 60,
+    "replace_in_db": true,
+    "backup_before_replace": true,
+    "enable_old_url_redirect_301": true,
+    "daemon_api_token": "CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32"
+  },
+  "logging": {
+    "level": "info",
+    "json": false
+  }
+}

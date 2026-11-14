@@ -1,0 +1,30 @@
+[Unit]
+Description=WP Offload Daemon - WordPress to Blogger image offload via Chrome Web UI
+Documentation=https://github.com/puleeno/nghesachxua.com/tree/main/agents/daemon
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/nghesachxua.com
+ExecStart=/usr/local/bin/wp-offload-daemon
+Environment=RUST_LOG=info
+Environment=DAEMON_CONFIG=/opt/nghesachxua.com/agents/config.json
+Environment=WEB_UI_DIST=/opt/nghesachxua.com/agents/web-ui/dist
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wp-offload-daemon
+Nice=10
+LimitNOFILE=65536
+LimitNPROC=4096
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/nghesachxua.com /var/log/wp-offload-daemon
+
+[Install]
+WantedBy=multi-user.target
