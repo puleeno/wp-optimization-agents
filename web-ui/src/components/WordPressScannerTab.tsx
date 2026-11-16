@@ -18,15 +18,18 @@ import { WordPressPost } from '../types/dashboard';
 
 interface WordPressScannerTabProps {
   posts: WordPressPost[];
-  onBatchOffloadPost: (postId: number) => void;
+  onBatchOffloadPost?: (postId: number) => void;
+  onProcessPost?: (postId: number) => void;
   onBatchOffloadAll: () => void;
 }
 
 export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
   posts,
   onBatchOffloadPost,
+  onProcessPost,
   onBatchOffloadAll,
 }) => {
+  const handleProcessPost = onProcessPost || onBatchOffloadPost || (() => {});
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'completed'>('all');
   const [selectedPost, setSelectedPost] = useState<WordPressPost | null>(null);
@@ -34,7 +37,8 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
   const [batchProgress, setBatchProgress] = useState(0);
 
   const filteredPosts = posts.filter((post) => {
-    if (searchTerm && !post.title.toLowerCase().includes(searchTerm.toLowerCase())) return false;
+    const title = post.title || '';
+    if (searchTerm && !title.toLowerCase().includes(searchTerm.toLowerCase())) return false;
     const isCompleted = post.offloadedImages === post.totalImages;
     if (statusFilter === 'pending' && isCompleted) return false;
     if (statusFilter === 'completed' && !isCompleted) return false;
@@ -250,7 +254,7 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
 
                         {!isFullyDone && (
                           <button
-                            onClick={() => onBatchOffloadPost(post.id)}
+                            onClick={() => handleProcessPost(post.id)}
                             className="px-2.5 py-1 text-white bg-orange-600 hover:bg-orange-500 rounded font-medium transition-colors"
                           >
                             Offload ngay
@@ -288,7 +292,7 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
             </div>
 
             <div className="space-y-3 pt-2">
-              {selectedPost.images.map((img, idx) => (
+              {(selectedPost.images || []).map((img, idx) => (
                 <div
                   key={idx}
                   className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 space-y-2 text-xs"
@@ -338,7 +342,7 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
               {selectedPost.offloadedImages < selectedPost.totalImages && (
                 <button
                   onClick={() => {
-                    onBatchOffloadPost(selectedPost.id);
+                    handleProcessPost(selectedPost.id);
                     setSelectedPost(null);
                   }}
                   className="px-4 py-2 text-xs font-semibold text-white bg-orange-600 hover:bg-orange-500 rounded-lg shadow-sm"

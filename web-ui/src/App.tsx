@@ -59,16 +59,82 @@ export default function App() {
     try {
       const [metrics, imgs, audits, postsData, configData] = await Promise.all([
         fetchJson<DaemonMetrics>(`${API_BASE}/metrics`),
-        fetchJson<OffloadImage[]>(`${API_BASE}/images?limit=100`),
+        fetchJson<any[]>(`${API_BASE}/images?limit=100`),
         fetchJson<DailyAuditRecord[]>(`${API_BASE}/audits`),
         fetchJson<WordPressPost[]>(`${API_BASE}/posts?limit=50`),
         fetchJson<AgentConfig>(`${API_BASE}/config`),
       ]);
       if (metrics) setDaemonMetrics(metrics);
-      if (imgs) setImages(imgs);
+      if (imgs) {
+        const mapped: OffloadImage[] = imgs.map((im: any) => ({
+          id: String(im.id ?? ''),
+          filename: (im.originUrl || '').split('/').pop() || `image-${im.id}`,
+          mimeType: im.mimeType || 'image/jpeg',
+          originalSizeBytes: im.originalSizeBytes ?? im.fileSize ?? 0,
+          offloadSizeBytes: im.offloadSizeBytes ?? 0,
+          width: im.width ?? 0,
+          height: im.height ?? 0,
+          originWpUrl: im.originUrl || '',
+          bloggerBaseUrl: im.bloggerUrl || '',
+          uploadedAt: im.createdAt || '',
+          status: im.status === 'replaced' || im.status === 'uploaded' ? 'synced' : im.status === 'failed' ? 'failed' : 'processing',
+          transformedParamString: '',
+          previewUrl: im.bloggerUrl || im.originUrl || '',
+        }));
+        setImages(mapped);
+      }
       if (audits) setDailyAudits(audits);
-      if (postsData) setPosts(postsData);
-      if (configData) setConfig(configData);
+      if (postsData) {
+        const mappedPosts: WordPressPost[] = (postsData as any[]).map((p: any) => ({
+          id: p.id,
+          title: p.title || `Post #${p.id}`,
+          slug: p.slug || '',
+          author: p.author || '',
+          publishedDate: p.publishedDate || p.linkedAt || '',
+          status: p.status === 'publish' ? 'publish' : 'draft',
+          totalImages: p.totalImages ?? 0,
+          offloadedImages: p.offloadedImages ?? p.replacedImages ?? 0,
+          images: Array.isArray(p.images) ? p.images : [],
+        }));
+        setPosts(mappedPosts);
+      }
+      if (configData) {
+        const cd: any = configData;
+        const normalized: any = {
+          ...cd,
+          wordpress: cd.wordpress || {
+            endpointUrl: cd.site?.url || '',
+            username: '',
+            appPasswordMasked: '',
+            mediaSyncChunkSize: 10,
+            replacePostContent: cd.daemon?.replace_in_db ?? true,
+            backupBeforeRewrite: cd.daemon?.backup_before_replace ?? true,
+          },
+          daemon: {
+            port: cd.daemon?.port ?? 2095,
+            logLevel: cd.logging?.level ?? 'info',
+            workerThreads: cd.daemon?.workerThreads ?? 4,
+            pollIntervalSec: cd.daemon?.poll_interval_sec ?? cd.daemon?.pollIntervalSec ?? 60,
+            autoRetryLimit: cd.daemon?.autoRetryLimit ?? 3,
+          },
+          blogger: {
+            blogId: cd.blogger?.blog_id ?? cd.blogger?.blogId ?? '',
+            albumName: cd.blogger?.albumName ?? '',
+            authType: cd.blogger?.authType ?? 'oauth2',
+            enableWebpAuto: cd.blogger?.enableWebpAuto ?? true,
+            defaultQuality: cd.blogger?.defaultQuality ?? 85,
+            cdnDomainOverride: cd.blogger?.cdnDomainOverride ?? '',
+          },
+          dailyAudit: cd.dailyAudit || {
+            enabled: false,
+            cronSchedule: '0 3 * * *',
+            targetUrls: [],
+            slackWebhook: '',
+            alertOnLcpAboveMs: 2500,
+          },
+        };
+        setConfig(normalized);
+      }
     } catch (e) {
       console.error('Failed to load data:', e);
     } finally {
@@ -210,7 +276,7 @@ export default function App() {
           {activeTab === 'overview' && (
             <OverviewTab
               metrics={daemonMetrics}
-              latestAudit={dailyAudits[0]}
+              latestAudit={dailyAudits[0] || null}
               onNavigateTab={setActiveTab}
               onTriggerAudit={handleTriggerAudit}
               isAuditing={isAuditing}

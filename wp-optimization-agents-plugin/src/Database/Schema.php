@@ -10,6 +10,7 @@ class Schema
         $charset_collate = $wpdb->get_charset_collate();
         $images_table = self::get_images_table_name();
         $jobs_table = self::get_jobs_table_name();
+        $redirect_logs_table = self::get_redirect_logs_table_name();
 
         // Mapping & sync state for offloaded images (source of truth for Rust agent DB access)
         $sql_images = "CREATE TABLE $images_table (
@@ -60,9 +61,30 @@ class Schema
             KEY created_at (created_at)
         ) $charset_collate;";
 
+        // Redirect hit logs for 301 analytics/charts
+        $sql_redirect_logs = "CREATE TABLE $redirect_logs_table (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            image_id bigint(20) unsigned DEFAULT NULL,
+            origin_url text NOT NULL,
+            origin_url_hash char(64) NOT NULL,
+            target_url text NOT NULL,
+            request_uri text DEFAULT NULL,
+            referer text DEFAULT NULL,
+            user_agent text DEFAULT NULL,
+            ip_hash char(64) DEFAULT NULL,
+            status_code smallint(5) unsigned NOT NULL DEFAULT 301,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY image_id (image_id),
+            KEY origin_url_hash (origin_url_hash),
+            KEY created_at (created_at),
+            KEY status_code (status_code)
+        ) $charset_collate;";
+
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
         dbDelta($sql_images);
         dbDelta($sql_jobs);
+        dbDelta($sql_redirect_logs);
     }
 
     public static function maybe_upgrade(): void
@@ -84,6 +106,12 @@ class Schema
     {
         global $wpdb;
         return $wpdb->prefix . 'wp_opt_agents_jobs';
+    }
+
+    public static function get_redirect_logs_table_name(): string
+    {
+        global $wpdb;
+        return $wpdb->prefix . 'wp_opt_agents_redirect_logs';
     }
 
     // Backward-compatible alias

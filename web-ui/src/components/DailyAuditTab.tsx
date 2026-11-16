@@ -31,8 +31,15 @@ export const DailyAuditTab: React.FC<DailyAuditTabProps> = ({
   isAuditing,
   activeAuditStep = 0,
 }) => {
-  const [selectedAudit, setSelectedAudit] = useState<DailyAuditRecord>(audits[0]);
+  const [selectedAudit, setSelectedAudit] = useState<DailyAuditRecord | null>(audits[0] || null);
   const [deviceFilter, setDeviceFilter] = useState<'all' | 'mobile' | 'desktop'>('all');
+
+  React.useEffect(() => {
+    if (!audits.length) { setSelectedAudit(null); return; }
+    if (!selectedAudit || !audits.find(a => a.id === selectedAudit.id)) {
+      setSelectedAudit(audits[0]);
+    }
+  }, [audits]);
 
   const filteredAudits = audits.filter((audit) => {
     if (deviceFilter !== 'all' && audit.device !== deviceFilter) return false;
@@ -288,7 +295,7 @@ export const DailyAuditTab: React.FC<DailyAuditTabProps> = ({
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
               {filteredAudits.map((audit) => {
-                const isSelected = selectedAudit.id === audit.id;
+                const isSelected = selectedAudit?.id === audit.id;
                 return (
                   <tr
                     key={audit.id}

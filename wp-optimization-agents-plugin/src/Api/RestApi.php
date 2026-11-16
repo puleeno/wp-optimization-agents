@@ -92,6 +92,12 @@ class RestApi
             'permission_callback' => [$this, 'check_daemon_permission'],
         ]);
 
+        register_rest_route($namespace, '/redirect-stats', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_redirect_stats'],
+            'permission_callback' => [$this, 'check_daemon_permission'],
+        ]);
+
         // Compatibility/legacy aliases
         register_rest_route($namespace, '/posts/(?P<id>\d+)/images', [
             'methods' => 'GET',
@@ -279,6 +285,15 @@ class RestApi
     {
         $repo = new \Puleeno\WPOptAgents\Repository\ImageRepository();
         return $this->respond(ApiResponse::success($repo->get_stats()));
+    }
+
+    public function get_redirect_stats(WP_REST_Request $request): WP_REST_Response
+    {
+        $days = (int)$request->get_param('days');
+        if ($days <= 0) {
+            $days = 30;
+        }
+        return $this->respond(ApiResponse::success($this->offloadService->get_redirect_stats($days)));
     }
 
     private function respond(ApiResponse $response): WP_REST_Response

@@ -16,8 +16,8 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('WP_OPT_AGENTS_VERSION', '0.2.0');
-define('WP_OPT_AGENTS_DB_VERSION', '2.0.0');
+define('WP_OPT_AGENTS_VERSION', '0.3.0');
+define('WP_OPT_AGENTS_DB_VERSION', '3.0.0');
 define('WP_OPT_AGENTS_FILE', __FILE__);
 define('WP_OPT_AGENTS_PATH', plugin_dir_path(__FILE__));
 define('WP_OPT_AGENTS_URL', plugin_dir_url(__FILE__));

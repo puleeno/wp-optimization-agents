@@ -26,7 +26,7 @@
   },
   "agent": {
     "host": "127.0.0.1",
-    "port": 2096,
+    "port": 2095,
     "poll_interval_secs": 60,
     "replace_in_db": true,
     "backup_before_replace": true,

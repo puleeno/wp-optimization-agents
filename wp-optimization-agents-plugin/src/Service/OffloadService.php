@@ -4,8 +4,10 @@ namespace Puleeno\WPOptAgents\Service;
 
 use Puleeno\WPOptAgents\Contracts\ImageRepositoryInterface;
 use Puleeno\WPOptAgents\Contracts\OffloadServiceInterface;
+use Puleeno\WPOptAgents\Contracts\RedirectLogRepositoryInterface;
 use Puleeno\WPOptAgents\Contracts\SettingsRepositoryInterface;
 use Puleeno\WPOptAgents\Repository\ImageRepository;
+use Puleeno\WPOptAgents\Repository\RedirectLogRepository;
 
 class OffloadService implements OffloadServiceInterface
 {
@@ -13,13 +15,17 @@ class OffloadService implements OffloadServiceInterface
     private $imageRepository;
     /** @var SettingsRepositoryInterface */
     private $settingsRepository;
+    /** @var RedirectLogRepositoryInterface */
+    private $redirectLogRepository;
 
     public function __construct(
         ImageRepositoryInterface $imageRepository,
-        SettingsRepositoryInterface $settingsRepository
+        SettingsRepositoryInterface $settingsRepository,
+        ?RedirectLogRepositoryInterface $redirectLogRepository = null
     ) {
         $this->imageRepository = $imageRepository;
         $this->settingsRepository = $settingsRepository;
+        $this->redirectLogRepository = $redirectLogRepository ?? new RedirectLogRepository();
     }
 
     public function scan_post_images(int $post_id): array
@@ -239,18 +245,57 @@ class OffloadService implements OffloadServiceInterface
         }
 
         $current = home_url($request_uri);
-        $target = $this->get_redirect_target($current);
-        if (!$target) {
-            // try without query normalization differences
-            $path_only = strtok($current, '?') ?: $current;
-            $target = $this->get_redirect_target($path_only);
+        $path_only = strtok($current, '?') ?: $current;
+
+        $row = $this->imageRepository->find_active_redirect_by_origin_url($current);
+        $matched_url = $current;
+        if (!$row) {
+            $row = $this->imageRepository->find_active_redirect_by_origin_url($path_only);
+            $matched_url = $path_only;
         }
-        if (!$target) {
+        if (!$row || empty($row['blogger_url'])) {
             return;
         }
 
+        $target = (string)$row['blogger_url'];
+        $this->log_redirect_hit($row, $matched_url, $target, $request_uri);
+
         wp_redirect($target, 301);
         exit;
+    }
+
+    public function get_redirect_stats(int $days = 30): array
+    {
+        $days = max(1, min(365, $days));
+        return [
+            'period_days' => $days,
+            'total_hits' => $this->redirectLogRepository->get_total_count(0),
+            'period_hits' => $this->redirectLogRepository->get_total_count($days),
+            'daily' => $this->redirectLogRepository->get_daily_stats($days),
+            'top' => $this->redirectLogRepository->get_top_redirects(10, $days),
+        ];
+    }
+
+    private function log_redirect_hit(array $image_row, string $origin_url, string $target_url, string $request_uri): void
+    {
+        try {
+            $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+            $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+            $referer = $_SERVER['HTTP_REFERER'] ?? '';
+            $this->redirectLogRepository->log([
+                'image_id' => isset($image_row['id']) ? (int)$image_row['id'] : null,
+                'origin_url' => $origin_url,
+                'origin_url_hash' => ImageRepository::hash_origin_url($origin_url),
+                'target_url' => $target_url,
+                'request_uri' => is_string($request_uri) ? $request_uri : null,
+                'referer' => is_string($referer) && $referer !== '' ? substr($referer, 0, 2000) : null,
+                'user_agent' => is_string($ua) && $ua !== '' ? substr($ua, 0, 1000) : null,
+                'ip_hash' => is_string($ip) && $ip !== '' ? hash('sha256', $ip . '|' . wp_salt('auth')) : null,
+                'status_code' => 301,
+            ]);
+        } catch (\Throwable $e) {
+            // Never block redirects because of logging failures
+        }
     }
 
     private function create_post_backup(int $post_id, string $content): array

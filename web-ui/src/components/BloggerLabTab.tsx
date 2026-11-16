@@ -37,8 +37,15 @@ export const BloggerLabTab: React.FC<BloggerLabTabProps> = ({
   onAddOffloadedImage,
 }) => {
   // Current selected or uploaded image
-  const [selectedImage, setSelectedImage] = useState<OffloadImage>(images[0]);
+  const [selectedImage, setSelectedImage] = useState<OffloadImage | null>(images[0] || null);
   const [copiedType, setCopiedType] = useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!images.length) { setSelectedImage(null); return; }
+    if (!selectedImage || !images.find(i => i.id === selectedImage.id)) {
+      setSelectedImage(images[0]);
+    }
+  }, [images]);
 
   // Transform parameters state
   const [params, setParams] = useState<BloggerTransformParams>({
@@ -63,16 +70,20 @@ export const BloggerLabTab: React.FC<BloggerLabTabProps> = ({
 
   // Calculate live transformed URL
   const currentSuffix = buildBloggerParamString(params);
-  const liveTransformedUrl = applyBloggerTransform(selectedImage.bloggerBaseUrl, params);
+  const liveTransformedUrl = selectedImage
+    ? applyBloggerTransform(selectedImage.bloggerBaseUrl || selectedImage.previewUrl || '', params)
+    : '';
 
   // Estimated size savings
-  const estimatedOffloadBytes = params.webpFormat
-    ? Math.round(selectedImage.originalSizeBytes * 0.055)
-    : Math.round(selectedImage.originalSizeBytes * 0.15);
+  const estimatedOffloadBytes = selectedImage
+    ? (params.webpFormat
+      ? Math.round(selectedImage.originalSizeBytes * 0.055)
+      : Math.round(selectedImage.originalSizeBytes * 0.15))
+    : 0;
 
-  const savingsPct = Math.round(
-    ((selectedImage.originalSizeBytes - estimatedOffloadBytes) / selectedImage.originalSizeBytes) * 100
-  );
+  const savingsPct = selectedImage && selectedImage.originalSizeBytes > 0
+    ? Math.round(((selectedImage.originalSizeBytes - estimatedOffloadBytes) / selectedImage.originalSizeBytes) * 100)
+    : 0;
 
   const handleCopy = (text: string, type: string) => {
     navigator.clipboard.writeText(text);
@@ -155,6 +166,37 @@ export const BloggerLabTab: React.FC<BloggerLabTabProps> = ({
       setTimeout(() => setUploadSuccessMsg(null), 4000);
     }, 600);
   };
+
+  if (!selectedImage) {
+    return (
+      <div className="space-y-6">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 p-4 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div>
+            <div className="flex items-center gap-2 text-xs text-orange-600 dark:text-orange-400 font-mono font-medium">
+              <span>BLOGGER MEDIA OFFLOAD ENGINE</span>
+              <span>·</span>
+              <span>GOOGLE USERCONTENT PARAMS</span>
+            </div>
+            <h2 className="text-lg font-bold text-slate-900 dark:text-white mt-0.5">Blogger Lab</h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Chưa có ảnh nào được offload. Quét bài viết và chạy offload để xem ảnh tại đây.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" className="hidden" />
+            <button onClick={() => fileInputRef.current?.click()} disabled={isUploading} className="px-4 py-2 text-xs font-semibold text-white bg-orange-600 hover:bg-orange-500 rounded-lg shadow-sm transition-all flex items-center gap-1.5 whitespace-nowrap">
+              <Upload className="w-4 h-4" />
+              <span>{isUploading ? 'Đang tải lên...' : 'Tải ảnh mới lên Blogger'}</span>
+            </button>
+          </div>
+        </div>
+        {uploadSuccessMsg && (
+          <div className="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>{uploadSuccessMsg}</span>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

@@ -27,6 +27,7 @@ struct HealthResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MetricsResponse {
     status: &'static str,
     pid: u32,
@@ -40,6 +41,7 @@ struct MetricsResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct StatsResponse {
     status: &'static str,
     total_images: u64,
@@ -56,6 +58,7 @@ struct StatsResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ImageResponse {
     id: i64,
     origin_url: String,
@@ -73,15 +76,16 @@ struct ImageResponse {
     error_message: Option<String>,
     redirect_active: bool,
     replaced_at: Option<DateTime<Utc>>,
-    created_at: Option<String>,
-    updated_at: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PostResponse {
     id: i64,
-    title: String,
-    status: String,
+    title: Option<String>,
+    status: Option<String>,
     total_images: i64,
     offloaded_images: i64,
     replaced_images: i64,
@@ -202,8 +206,8 @@ async fn list_images(State(state): State<AppState>, Query(q): Query<ListQuery>) 
             error_message: im.error_message,
             redirect_active: im.redirect_active != 0,
             replaced_at: im.replaced_at.and_then(|s: String| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)),
-            created_at: im.created_at,
-            updated_at: im.updated_at,
+            created_at: im.created_at.unwrap_or_default(),
+            updated_at: im.updated_at.unwrap_or_default(),
         }).collect()),
 Err(e) => {
             tracing::error!("list_images failed: {}", e);
@@ -222,8 +226,8 @@ async fn list_posts(State(state): State<AppState>, Query(q): Query<ListQuery>) -
     match db.list_posts_with_stats(limit, offset).await {
         Ok(posts) => Json(posts.into_iter().map(|p| PostResponse {
             id: p.id,
-            title: p.title,
-            status: p.status,
+            title: Some(p.title),
+            status: Some(p.status),
             total_images: p.total_images,
             offloaded_images: p.offloaded_images,
             replaced_images: p.replaced_images,

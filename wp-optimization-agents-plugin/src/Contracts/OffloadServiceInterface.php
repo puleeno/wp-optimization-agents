@@ -13,6 +13,7 @@ interface OffloadServiceInterface
     public function replace_post_content(int $post_id, array $replacements): array;
     public function get_redirect_target(string $origin_url): ?string;
     public function maybe_redirect_old_url(): void;
+    public function get_redirect_stats(int $days = 30): array;
     public function link_blogger_post(int $post_id, array $data): bool;
     public function get_blogger_post_link(int $post_id): array;
 }

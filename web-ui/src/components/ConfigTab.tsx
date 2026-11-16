@@ -27,6 +27,21 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({ config, onSaveConfig }) =>
   const [jsonText, setJsonText] = useState(JSON.stringify(config, null, 2));
   const [jsonError, setJsonError] = useState<string | null>(null);
 
+  React.useEffect(() => {
+    if (config) {
+      setFormData(config);
+      setJsonText(JSON.stringify(config, null, 2));
+    }
+  }, [config]);
+
+  if (!formData) {
+    return (
+      <div className="p-5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm text-slate-500 dark:text-slate-400">
+        Đang tải cấu hình...
+      </div>
+    );
+  }
+
   const handleSave = () => {
     onSaveConfig(formData);
     setJsonText(JSON.stringify(formData, null, 2));

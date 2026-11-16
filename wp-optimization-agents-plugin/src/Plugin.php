@@ -9,6 +9,7 @@ use Puleeno\WPOptAgents\Admin\Settings;
 use Puleeno\WPOptAgents\Contracts\SettingsRepositoryInterface;
 use Puleeno\WPOptAgents\Database\Schema;
 use Puleeno\WPOptAgents\Repository\ImageRepository;
+use Puleeno\WPOptAgents\Repository\RedirectLogRepository;
 use Puleeno\WPOptAgents\Repository\SettingsRepository;
 use Puleeno\WPOptAgents\Service\OffloadService;
 use Puleeno\WPOptAgents\Service\SettingsService;
@@ -81,10 +82,21 @@ class Plugin
         });
     }
 
+    public function redirectLogRepository(): RedirectLogRepository
+    {
+        return $this->make('redirect_log_repository', function () {
+            return new RedirectLogRepository();
+        });
+    }
+
     public function offloadService(): OffloadService
     {
         return $this->make('offload_service', function (Plugin $plugin) {
-            return new OffloadService($plugin->imageRepository(), $plugin->settingsRepository());
+            return new OffloadService(
+                $plugin->imageRepository(),
+                $plugin->settingsRepository(),
+                $plugin->redirectLogRepository()
+            );
         });
     }
 
