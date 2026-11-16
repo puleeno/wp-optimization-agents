@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
@@ -37,13 +37,19 @@ const PATH_TO_TAB: Record<string, string> = {
 
 const API_BASE = '/api';
 
-async function fetchJson<T>(url: string): Promise<T | null> {
+type FetchResult<T> = { ok: boolean; status: number; data: T | null };
+
+async function fetchJson<T>(url: string, timeoutMs = 8000): Promise<FetchResult<T>> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    return await res.json();
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) return { ok: false, status: res.status, data: null };
+    return { ok: true, status: res.status, data: (await res.json()) as T };
   } catch {
-    return null;
+    return { ok: false, status: 0, data: null };
+  } finally {
+    clearTimeout(t);
   }
 }
 
@@ -66,7 +72,10 @@ export default function App() {
   const [activeAuditStep, setActiveAuditStep] = useState<number>(0);
   const [loading, setLoading] = useState<boolean>(true);
 
+  const listBackoffRef = useRef(30000);
+  const esRef = useRef<EventSource | null>(null);
   const pendingPostsCount = 0;
+  const siteUrl = (config as any)?.site?.url || (config as any)?.wordpress?.endpointUrl || '';
 
   useEffect(() => {
     if (darkMode) {
@@ -77,91 +86,189 @@ export default function App() {
   }, [darkMode]);
 
   const loadCurrentTask = useCallback(async () => {
-    const data = await fetchJson<any>(`${API_BASE}/tasks/current`);
-    if (data) setCurrentTask(data.task ?? null);
+    if (typeof document !== 'undefined' && document.hidden) return;
+    const res = await fetchJson<any>(`${API_BASE}/tasks/current`, 6000);
+    if (res.ok && res.data) setCurrentTask(res.data.task ?? null);
   }, []);
 
-  const loadAllData = useCallback(async () => {
-    setLoading(true);
+  const applyConfig = useCallback((configData: any) => {
+    const cd: any = configData;
+    const normalized: any = {
+      ...cd,
+      wordpress: cd.wordpress || {
+        endpointUrl: cd.site?.url || '',
+        username: '',
+        appPasswordMasked: '',
+        mediaSyncChunkSize: 10,
+        replacePostContent: cd.daemon?.replace_in_db ?? true,
+        backupBeforeRewrite: cd.daemon?.backup_before_replace ?? true,
+      },
+      daemon: {
+        port: cd.daemon?.port ?? 2095,
+        logLevel: cd.logging?.level ?? 'info',
+        workerThreads: cd.daemon?.workerThreads ?? 4,
+        pollIntervalSec: cd.daemon?.poll_interval_sec ?? cd.daemon?.pollIntervalSec ?? 60,
+        autoRetryLimit: cd.daemon?.autoRetryLimit ?? 3,
+      },
+      blogger: {
+        blogId: cd.blogger?.blog_id ?? cd.blogger?.blogId ?? '',
+        albumName: cd.blogger?.albumName ?? '',
+        authType: cd.blogger?.authType ?? 'oauth2',
+        enableWebpAuto: cd.blogger?.enableWebpAuto ?? true,
+        defaultQuality: cd.blogger?.defaultQuality ?? 85,
+        cdnDomainOverride: cd.blogger?.cdnDomainOverride ?? '',
+      },
+      dailyAudit: cd.dailyAudit || {
+        enabled: false,
+        cronSchedule: '0 3 * * *',
+        targetUrls: [],
+        slackWebhook: '',
+        alertOnLcpAboveMs: 2500,
+      },
+    };
+    setConfig(normalized);
+  }, []);
+
+  const applyImages = useCallback((imgs: any[]) => {
+    const mapped: OffloadImage[] = imgs.map((im: any) => ({
+      id: String(im.id ?? ''),
+      filename: (im.originUrl || '').split('/').pop() || `image-${im.id}`,
+      mimeType: im.mimeType || 'image/jpeg',
+      originalSizeBytes: im.originalSizeBytes ?? im.fileSize ?? 0,
+      offloadSizeBytes: im.offloadSizeBytes ?? 0,
+      width: im.width ?? 0,
+      height: im.height ?? 0,
+      originWpUrl: im.originUrl || '',
+      bloggerBaseUrl: im.bloggerUrl || '',
+      uploadedAt: im.createdAt || '',
+      status: im.status === 'replaced' || im.status === 'uploaded' ? 'synced' : im.status === 'failed' ? 'failed' : 'processing',
+      transformedParamString: '',
+      previewUrl: im.bloggerUrl || im.originUrl || '',
+    }));
+    setImages(mapped);
+  }, []);
+
+  // Fetch only data relevant to the active tab; poll less often and backoff on errors.
+  const loadTabData = useCallback(async (opts?: { includeConfig?: boolean; force?: boolean }) => {
+    if (typeof document !== 'undefined' && document.hidden && !opts?.force) return;
+    const includeConfig = !!opts?.includeConfig || !config;
     try {
-      const [metrics, imgs, audits, configData, taskData] = await Promise.all([
-        fetchJson<DaemonMetrics>(`${API_BASE}/metrics`),
-        fetchJson<any[]>(`${API_BASE}/images?limit=100`),
-        fetchJson<DailyAuditRecord[]>(`${API_BASE}/audits`),
-        fetchJson<AgentConfig>(`${API_BASE}/config`),
-        fetchJson<any>(`${API_BASE}/tasks/current`),
+      const needMetrics = activeTab === 'overview' || activeTab === 'daemon_engine';
+      const needImages = activeTab === 'blogger_lab';
+      const needAudits = activeTab === 'daily_audit' || activeTab === 'overview';
+      const needTask = activeTab === 'overview' || activeTab === 'daemon_engine';
+
+      const [metricsR, imgsR, auditsR, configR, taskR] = await Promise.all([
+        needMetrics ? fetchJson<DaemonMetrics>(`${API_BASE}/metrics`) : Promise.resolve(null),
+        needImages ? fetchJson<any[]>(`${API_BASE}/images?limit=100`) : Promise.resolve(null),
+        needAudits ? fetchJson<DailyAuditRecord[]>(`${API_BASE}/audits`) : Promise.resolve(null),
+        includeConfig ? fetchJson<AgentConfig>(`${API_BASE}/config`) : Promise.resolve(null),
+        needTask ? fetchJson<any>(`${API_BASE}/tasks/current`, 6000) : Promise.resolve(null),
       ]);
-      if (taskData) setCurrentTask(taskData.task ?? null);
-      if (metrics) setDaemonMetrics(metrics);
-      if (imgs) {
-        const mapped: OffloadImage[] = imgs.map((im: any) => ({
-          id: String(im.id ?? ''),
-          filename: (im.originUrl || '').split('/').pop() || `image-${im.id}`,
-          mimeType: im.mimeType || 'image/jpeg',
-          originalSizeBytes: im.originalSizeBytes ?? im.fileSize ?? 0,
-          offloadSizeBytes: im.offloadSizeBytes ?? 0,
-          width: im.width ?? 0,
-          height: im.height ?? 0,
-          originWpUrl: im.originUrl || '',
-          bloggerBaseUrl: im.bloggerUrl || '',
-          uploadedAt: im.createdAt || '',
-          status: im.status === 'replaced' || im.status === 'uploaded' ? 'synced' : im.status === 'failed' ? 'failed' : 'processing',
-          transformedParamString: '',
-          previewUrl: im.bloggerUrl || im.originUrl || '',
-        }));
-        setImages(mapped);
+
+      const results = [metricsR, imgsR, auditsR, configR, taskR].filter(Boolean) as FetchResult<any>[];
+      const hadAny = results.length > 0;
+      const allFailed = hadAny && results.every(r => !r.ok);
+      if (allFailed) {
+        listBackoffRef.current = Math.min(listBackoffRef.current * 2, 120000);
+      } else if (hadAny) {
+        listBackoffRef.current = 30000;
       }
-      if (audits) setDailyAudits(audits);
-      if (configData) {
-        const cd: any = configData;
-        const normalized: any = {
-          ...cd,
-          wordpress: cd.wordpress || {
-            endpointUrl: cd.site?.url || '',
-            username: '',
-            appPasswordMasked: '',
-            mediaSyncChunkSize: 10,
-            replacePostContent: cd.daemon?.replace_in_db ?? true,
-            backupBeforeRewrite: cd.daemon?.backup_before_replace ?? true,
-          },
-          daemon: {
-            port: cd.daemon?.port ?? 2095,
-            logLevel: cd.logging?.level ?? 'info',
-            workerThreads: cd.daemon?.workerThreads ?? 4,
-            pollIntervalSec: cd.daemon?.poll_interval_sec ?? cd.daemon?.pollIntervalSec ?? 60,
-            autoRetryLimit: cd.daemon?.autoRetryLimit ?? 3,
-          },
-          blogger: {
-            blogId: cd.blogger?.blog_id ?? cd.blogger?.blogId ?? '',
-            albumName: cd.blogger?.albumName ?? '',
-            authType: cd.blogger?.authType ?? 'oauth2',
-            enableWebpAuto: cd.blogger?.enableWebpAuto ?? true,
-            defaultQuality: cd.blogger?.defaultQuality ?? 85,
-            cdnDomainOverride: cd.blogger?.cdnDomainOverride ?? '',
-          },
-          dailyAudit: cd.dailyAudit || {
-            enabled: false,
-            cronSchedule: '0 3 * * *',
-            targetUrls: [],
-            slackWebhook: '',
-            alertOnLcpAboveMs: 2500,
-          },
-        };
-        setConfig(normalized);
-      }
+
+      if (metricsR?.ok && metricsR.data) setDaemonMetrics(metricsR.data);
+      if (imgsR?.ok && Array.isArray(imgsR.data)) applyImages(imgsR.data);
+      if (auditsR?.ok && Array.isArray(auditsR.data)) setDailyAudits(auditsR.data);
+      if (configR?.ok && configR.data) applyConfig(configR.data);
+      if (taskR?.ok && taskR.data) setCurrentTask(taskR.data.task ?? null);
     } catch (e) {
       console.error('Failed to load data:', e);
+      listBackoffRef.current = Math.min(listBackoffRef.current * 2, 120000);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [activeTab, config, applyConfig, applyImages]);
 
+  const loadAllData = useCallback(async () => loadTabData({ force: true }), [loadTabData]);
+
+  // Initial load + config
   useEffect(() => {
-    loadAllData();
-    const interval = setInterval(loadAllData, 10000);
-    const taskInterval = setInterval(loadCurrentTask, 3000);
-    return () => { clearInterval(interval); clearInterval(taskInterval); };
-  }, [loadAllData, loadCurrentTask]);
+    loadTabData({ includeConfig: true, force: true });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Tab-scoped polling with backoff and visibility awareness
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const tick = async () => {
+      if (cancelled) return;
+      await loadTabData();
+      if (cancelled) return;
+      timer = window.setTimeout(tick, listBackoffRef.current);
+    };
+    if (typeof document === 'undefined' || !document.hidden) {
+      tick();
+    }
+    const onVis = () => {
+      if (!document.hidden) {
+        listBackoffRef.current = 30000;
+        if (timer) window.clearTimeout(timer);
+        tick();
+      } else if (timer) {
+        window.clearTimeout(timer);
+      }
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [loadTabData]);
+
+  // Realtime current task: SSE (preferred) with 6s polling fallback
+  useEffect(() => {
+    const shouldStream = activeTab === 'overview' || activeTab === 'daemon_engine';
+    let poll: number | undefined;
+    const stop = () => {
+      if (esRef.current) { esRef.current.close(); esRef.current = null; }
+      if (poll) { window.clearInterval(poll); poll = undefined; }
+    };
+    if (!shouldStream) { stop(); return; }
+
+    const startFallback = () => {
+      if (poll) return;
+      loadCurrentTask();
+      poll = window.setInterval(() => loadCurrentTask(), 6000);
+    };
+
+    if (typeof EventSource !== 'undefined') {
+      try {
+        const es = new EventSource(`${API_BASE}/tasks/stream`);
+        esRef.current = es;
+        es.addEventListener('task', (ev: MessageEvent) => {
+          try {
+            const data = JSON.parse(ev.data);
+            setCurrentTask(data?.task ?? null);
+          } catch {}
+        });
+        es.onerror = () => {
+          // will auto-retry; also keep a light fallback to ensure updates if stream unsupported/blocked
+          if (!poll) startFallback();
+        };
+      } catch {
+        startFallback();
+      }
+    } else {
+      startFallback();
+    }
+
+    const onVis = () => { if (document.hidden) { /* keep connection light; browser throttles anyway */ } else { loadCurrentTask(); } };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { document.removeEventListener('visibilitychange', onVis); stop(); };
+  }, [activeTab, loadCurrentTask]);
+
+  // When tab changes, refresh immediately for that tab
+  useEffect(() => { loadTabData({ force: true }); }, [activeTab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleAddOffloadedImage = async (newImage: OffloadImage) => {
     setImages((prev) => [newImage, ...prev]);
@@ -271,6 +378,7 @@ export default function App() {
         onClose={() => setSidebarOpen(false)}
         onTriggerAudit={handleTriggerAudit}
         isAuditing={isAuditing}
+        siteUrl={siteUrl}
       />
 
       <div className="flex-1 flex flex-col min-w-0 lg:pl-64">
@@ -306,6 +414,7 @@ export default function App() {
                 <BloggerLabTab
                   images={images}
                   onAddOffloadedImage={handleAddOffloadedImage}
+                  siteUrl={siteUrl}
                 />
               }
             />

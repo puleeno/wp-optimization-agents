@@ -4,7 +4,10 @@ use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::offload::{CurrentTask, OffloadEngine};
 use crate::webhook::{run_blogger_queue_worker, MediaUploadPayload, WebhookProcessor};
-use axum::{extract::{Path, Query, State}, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
+use axum::{extract::{Path, Query, State}, http::StatusCode, response::{sse::{Event, KeepAlive, Sse}, IntoResponse}, routing::{get, post}, Json, Router};
+use futures_util::stream::{self, Stream};
+use std::convert::Infallible;
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -133,6 +136,7 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/audits", get(list_audits))
         .route("/api/config", get(get_config))
         .route("/api/tasks/current", get(get_current_task))
+        .route("/api/tasks/stream", get(get_current_task_stream))
         .route("/api/posts/:id/process", post(process_post))
         .route("/api/attachments/:id/process", post(process_attachment))
         .route("/api/webhooks/media-upload", post(media_upload_webhook))
@@ -366,6 +370,18 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
 async fn get_current_task(State(state): State<AppState>) -> impl IntoResponse {
     let task = state.current_task.read().await.clone();
     Json(serde_json::json!({"ok": true, "task": task}))
+}
+
+async fn get_current_task_stream(State(state): State<AppState>) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    let st = stream::unfold((state, true), |(state, first)| async move {
+        if !first {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        let task = state.current_task.read().await.clone();
+        let payload = serde_json::json!({"ok": true, "task": task}).to_string();
+        Some((Ok(Event::default().event("task").data(payload)), (state, false)))
+    });
+    Sse::new(st).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keepalive"))
 }
 
 async fn process_post(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {

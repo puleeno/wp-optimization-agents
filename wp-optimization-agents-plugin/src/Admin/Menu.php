@@ -21,7 +21,7 @@ class Menu
             'manage_options',
             'wp-opt-agents',
             [$this->renderer, 'render_dashboard'],
-            'dashicons-rocket',
+            'dashicons-superhero',
             58
         );
 

@@ -30,12 +30,15 @@ import {
 interface BloggerLabTabProps {
   images: OffloadImage[];
   onAddOffloadedImage: (image: OffloadImage) => void;
+  siteUrl?: string;
 }
 
 export const BloggerLabTab: React.FC<BloggerLabTabProps> = ({
   images,
   onAddOffloadedImage,
+  siteUrl,
 }) => {
+  const wpBase = (siteUrl || '').replace(/\/$/, '');
   // Current selected or uploaded image
   const [selectedImage, setSelectedImage] = useState<OffloadImage | null>(images[0] || null);
   const [copiedType, setCopiedType] = useState<string | null>(null);
@@ -116,7 +119,7 @@ export const BloggerLabTab: React.FC<BloggerLabTabProps> = ({
             offloadSizeBytes: Math.round(file.size * 0.06),
             width: img.naturalWidth || 1920,
             height: img.naturalHeight || 1080,
-            originWpUrl: `https://vietnamtechreview.com/wp-content/uploads/2026/11/${file.name}`,
+            originWpUrl: wpBase ? `${wpBase}/wp-content/uploads/2026/11/${file.name}` : file.name,
             bloggerBaseUrl: `https://blogger.googleusercontent.com/img/a/${fakeBloggerId}`,
             uploadedAt: 'Vừa xong',
             status: 'synced',

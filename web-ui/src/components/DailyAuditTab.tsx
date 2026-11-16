@@ -105,7 +105,7 @@ export const DailyAuditTab: React.FC<DailyAuditTabProps> = ({
               </h3>
             </div>
             <span className="text-xs font-mono text-amber-400">
-              Mục tiêu: https://vietnamtechreview.com/danh-gia-sony-a7-iv/
+              Mục tiêu: {selectedAudit?.targetSiteUrl || 'Đang kiểm tra theo cấu hình'}
             </span>
           </div>
 

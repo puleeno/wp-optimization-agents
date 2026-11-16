@@ -23,12 +23,13 @@ import { DaemonMetrics } from '../types/dashboard';
 interface SidebarProps {
   activeTab: string;
   setActiveTab: (tab: string) => void;
-  daemonMetrics: DaemonMetrics;
+  daemonMetrics: DaemonMetrics | null;
   pendingPostsCount: number;
   isOpen: boolean;
   onClose: () => void;
   onTriggerAudit: () => void;
   isAuditing: boolean;
+  siteUrl?: string;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -40,7 +41,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onClose,
   onTriggerAudit,
   isAuditing,
+  siteUrl,
 }) => {
+  const siteLabel = siteUrl ? siteUrl.replace(/^https?:\/\//, '').replace(/\/$/, '') : 'WordPress site';
+  const metrics = daemonMetrics || { status: 'stopped', pid: 0, memoryUsageMb: 0, cpuPercent: 0, tokioWorkers: 0 } as any;
   const mainNavItems = [
     {
       id: 'overview',
@@ -134,8 +138,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="px-5 py-2.5 bg-slate-50/70 dark:bg-slate-900/60 border-b border-slate-100 dark:border-slate-800/80 flex items-center justify-between text-xs">
             <div className="flex items-center gap-1.5 truncate">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
-              <span className="text-[11px] text-slate-600 dark:text-slate-300 font-mono truncate">
-                vietnamtechreview.com
+              <span className="text-[11px] text-slate-600 dark:text-slate-300 font-mono truncate" title={siteUrl || ''}>
+                {siteLabel}
               </span>
             </div>
             <span className="text-[10px] font-mono text-emerald-600 dark:text-emerald-400 font-semibold shrink-0">
@@ -241,7 +245,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-200">
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    daemonMetrics.status === 'running'
+                    metrics.status === 'running'
                       ? 'bg-emerald-500 ring-2 ring-emerald-500/20'
                       : 'bg-rose-500'
                   }`}
@@ -249,14 +253,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <span>Rust Tokio Service</span>
               </div>
               <span className="text-[10px] font-mono text-slate-400">
-                PID:{daemonMetrics.pid}
+                PID:{metrics.pid}
               </span>
             </div>
 
             <div className="grid grid-cols-2 gap-1 text-[11px] font-mono text-slate-500 dark:text-slate-400 pt-1 border-t border-slate-200/60 dark:border-slate-800/60">
-              <div>RAM: {daemonMetrics.memoryUsageMb}MB</div>
-              <div>CPU: {daemonMetrics.cpuPercent}%</div>
-              <div>Tokio: {daemonMetrics.tokioWorkers}T</div>
+              <div>RAM: {metrics.memoryUsageMb}MB</div>
+              <div>CPU: {metrics.cpuPercent}%</div>
+              <div>Tokio: {metrics.tokioWorkers}T</div>
               <div>PyO3: OK</div>
             </div>
           </div>
