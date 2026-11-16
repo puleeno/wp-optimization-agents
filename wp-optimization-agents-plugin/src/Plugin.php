@@ -43,6 +43,7 @@ class Plugin
 
         add_action('admin_init', [Schema::class, 'maybe_upgrade']);
         add_action('template_redirect', [$this->offloadService(), 'maybe_redirect_old_url'], 1);
+        add_filter('wp_generate_attachment_metadata', [$this, 'on_attachment_metadata_generated'], 20, 2);
 
         if (is_admin()) {
             $this->menu()->register();
@@ -105,6 +106,87 @@ class Plugin
         return $this->make('rest_api', function (Plugin $plugin) {
             return new RestApi($plugin->settingsService(), $plugin->offloadService());
         });
+    }
+
+    /**
+     * Notify daemon after WP generates attachment metadata (file + sizes ready).
+     * @param array<string,mixed> $metadata
+     * @return array<string,mixed>
+     */
+    public function on_attachment_metadata_generated($metadata, $attachment_id)
+    {
+        try {
+            $attachment_id = (int)$attachment_id;
+            if ($attachment_id <= 0 || !wp_attachment_is_image($attachment_id)) {
+                return $metadata;
+            }
+            $settings = $this->settingsService()->all();
+            if (empty($settings['notify_daemon_on_upload'])) {
+                return $metadata;
+            }
+            $daemon_url = isset($settings['daemon_url']) ? rtrim((string)$settings['daemon_url'], '/') : '';
+            if ($daemon_url === '') {
+                return $metadata;
+            }
+            $file = get_attached_file($attachment_id);
+            $url = wp_get_attachment_url($attachment_id);
+            $mime = get_post_mime_type($attachment_id);
+            $post_parent = (int)wp_get_post_parent_id($attachment_id);
+            $width = isset($metadata['width']) ? (int)$metadata['width'] : null;
+            $height = isset($metadata['height']) ? (int)$metadata['height'] : null;
+            $filesize = ($file && file_exists($file)) ? (filesize($file) ?: null) : null;
+            $upload_dir = wp_upload_dir();
+            $base_dir = isset($upload_dir['basedir']) ? (string)$upload_dir['basedir'] : '';
+            $base_url = isset($upload_dir['baseurl']) ? (string)$upload_dir['baseurl'] : '';
+            $sizes = [];
+            if (is_array($metadata) && !empty($metadata['sizes']) && is_array($metadata['sizes'])) {
+                $rel_dir = '';
+                if (!empty($metadata['file']) && is_string($metadata['file'])) {
+                    $rel_dir = trim(dirname($metadata['file']), '/\\.');
+                }
+                foreach ($metadata['sizes'] as $name => $info) {
+                    if (!is_array($info) || empty($info['file'])) {
+                        continue;
+                    }
+                    $sz_file = (string)$info['file'];
+                    $rel_path = $rel_dir !== '' ? ($rel_dir . '/' . $sz_file) : $sz_file;
+                    $sizes[] = [
+                        'size' => (string)$name,
+                        'url' => $base_url ? rtrim($base_url, '/') . '/' . ltrim($rel_path, '/') : '',
+                        'path' => $base_dir ? rtrim($base_dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . ltrim(str_replace('/', DIRECTORY_SEPARATOR, $rel_path), DIRECTORY_SEPARATOR) : null,
+                        'width' => isset($info['width']) ? (int)$info['width'] : null,
+                        'height' => isset($info['height']) ? (int)$info['height'] : null,
+                        'mime_type' => isset($info['mime-type']) ? (string)$info['mime-type'] : null,
+                        'file_size' => (isset($info['filesize']) ? (int)$info['filesize'] : null),
+                    ];
+                }
+            }
+            $payload = [
+                'attachment_id' => $attachment_id,
+                'post_id' => $post_parent > 0 ? $post_parent : null,
+                'file' => $file ?: null,
+                'url' => $url ?: null,
+                'mime_type' => $mime ?: null,
+                'width' => $width,
+                'height' => $height,
+                'file_size' => $filesize,
+                'sizes' => $sizes,
+            ];
+            $headers = ['Content-Type' => 'application/json'];
+            $token = isset($settings['daemon_api_token']) ? (string)$settings['daemon_api_token'] : '';
+            if ($token !== '') {
+                $headers['Authorization'] = 'Bearer ' . $token;
+            }
+            wp_remote_post($daemon_url . '/api/webhooks/media-upload', [
+                'headers' => $headers,
+                'timeout' => 5,
+                'blocking' => false,
+                'body' => wp_json_encode($payload),
+            ]);
+        } catch (\Throwable $e) {
+            // never break uploads
+        }
+        return $metadata;
     }
 
     public function renderer(): Renderer

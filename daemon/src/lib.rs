@@ -3,8 +3,10 @@ pub mod chrome;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod imgbb;
 pub mod main_lib;
 pub mod offload;
+pub mod webhook;
 pub mod wp_api;
 
 pub use config::Config;

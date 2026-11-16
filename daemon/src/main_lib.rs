@@ -1,9 +1,10 @@
 use crate::chrome::default_chrome_path;
 use crate::config::Config;
-use crate::db::{Db, ImageMapRow, PostStatsRow};
+use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::offload::{CurrentTask, OffloadEngine};
-use axum::{extract::{Path, Query, State}, response::IntoResponse, routing::{get, post}, Json, Router};
+use crate::webhook::{run_blogger_queue_worker, MediaUploadPayload, WebhookProcessor};
+use axum::{extract::{Path, Query, State}, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,8 +18,11 @@ use chrono::{DateTime, Utc};
 pub struct AppState {
     pub config: Arc<Config>,
     pub engine: Option<Arc<OffloadEngine>>,
+    pub db: Option<Db>,
     pub db_ok: bool,
     pub current_task: Arc<RwLock<Option<CurrentTask>>>,
+    pub webhook: Option<Arc<WebhookProcessor>>,
+    pub http: reqwest::Client,
 }
 
 #[derive(Serialize)]
@@ -128,6 +132,10 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/config", get(get_config))
         .route("/api/tasks/current", get(get_current_task))
         .route("/api/posts/:id/process", post(process_post))
+        .route("/api/webhooks/media-upload", post(media_upload_webhook))
+        .route("/webhook/media-upload", post(media_upload_webhook))
+        .route("/cdn/*path", get(cdn_proxy))
+        .route("/wp-content/uploads/*path", get(cdn_proxy_uploads))
         .with_state(state.clone());
 
     // Register ALL routes directly - API routes first, then static files as fallback
@@ -310,6 +318,14 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         "site": {
             "url": cfg.site.url,
             "uploads_dir": cfg.site.uploads_dir,
+        },
+        "imgbb": {
+            "enabled": cfg.imgbb.enabled,
+            "api_key_set": !cfg.imgbb.api_key.trim().is_empty(),
+        },
+        "cdn": {
+            "host": cfg.cdn.host,
+            "scheme": cfg.cdn.scheme,
         }
     }))
 }
@@ -326,6 +342,59 @@ async fn process_post(State(state): State<AppState>, Path(id): Path<i64>) -> imp
     match engine.process_post(id).await {
         Ok(v) => (axum::http::StatusCode::OK, Json(serde_json::json!({"ok":true,"data":v}))),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()}))),
+    }
+}
+
+async fn cdn_proxy(State(state): State<AppState>, Path(path): Path<String>) -> impl IntoResponse {
+    proxy_by_path(state, path).await
+}
+
+async fn cdn_proxy_uploads(State(state): State<AppState>, Path(path): Path<String>) -> impl IntoResponse {
+    let full = format!("wp-content/uploads/{}", path.trim_start_matches('/'));
+    proxy_by_path(state, full).await
+}
+
+async fn proxy_by_path(state: AppState, path: String) -> impl IntoResponse {
+    let Some(db) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "db not ready").into_response();
+    };
+    match db.get_cdn_target_by_path(&path).await {
+        Ok(Some(target)) => match state.http.get(&target).send().await {
+            Ok(resp) => {
+                let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
+                match resp.bytes().await {
+                    Ok(bytes) => (status, [(axum::http::header::CONTENT_TYPE, ct), (axum::http::header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string())], bytes).into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, format!("read upstream: {e}")).into_response(),
+                }
+            }
+            Err(e) => (StatusCode::BAD_GATEWAY, format!("fetch upstream: {e}")).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("cdn lookup error: {e}")).into_response(),
+    }
+}
+
+async fn media_upload_webhook(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<MediaUploadPayload>,
+) -> impl IntoResponse {
+    // auth: Bearer token same as daemon_api_token
+    let expected = state.config.agent.daemon_api_token.clone();
+    if !expected.is_empty() {
+        let auth = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let ok = auth.strip_prefix("Bearer ").map(|t| t == expected).unwrap_or(false);
+        if !ok {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"ok":false,"error":"unauthorized"})));
+        }
+    }
+    let Some(webhook) = state.webhook.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"webhook processor not ready"})));
+    };
+    match webhook.process_media_upload(payload).await {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()}))),
     }
 }
 
@@ -348,11 +417,31 @@ pub async fn run_server(config: Config, host_override: Option<String>, port_over
         }
     };
 
+    let db_shared = if db_ok {
+        match Db::new((*cfg).clone()) {
+            Ok(db) => {
+                if let Err(e) = db.ensure_pipeline_tables().await { tracing::warn!("ensure pipeline tables failed: {}", e); }
+                Some(db)
+            }
+            Err(e) => { tracing::warn!("shared db init failed: {}", e); None }
+        }
+    } else { None };
+
+    let webhook = if let Some(db) = db_shared.clone() {
+        let wp = Arc::new(WebhookProcessor::new(db, cfg.clone()));
+        let bg_wp = wp.clone();
+        let bg_cfg = cfg.clone();
+        let bg_engine = engine.clone();
+        tokio::spawn(async move { run_blogger_queue_worker(bg_wp, bg_cfg, bg_engine).await; });
+        Some(wp)
+    } else { None };
+
     if !dist_dir.exists() {
         tracing::warn!("web-ui dist not found: {} (build agents/web-ui)", dist_dir.display());
     }
 
-    let state = AppState { config: cfg, engine, db_ok, current_task };
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().unwrap_or_else(|_| reqwest::Client::new());
+    let state = AppState { config: cfg, engine, db: db_shared, db_ok, current_task, webhook, http };
     let app = create_router(state, dist_dir);
     let addr: SocketAddr = format!("{host}:{port}").parse().map_err(|e| Error::ConfigError(format!("invalid bind addr: {e}")))?;
     tracing::info!("wp-offload-daemon listening on http://{addr} (web-ui + API), chrome={}", default_chrome_path().display());

@@ -47,10 +47,12 @@ class Settings
 
         add_settings_section('wp_opt_agents_daemon', 'Agent Daemon', null, 'wp_opt_agents');
         add_settings_field('daemon_port', 'Daemon Port', [$this, 'field_daemon_port'], 'wp_opt_agents', 'wp_opt_agents_daemon');
+        add_settings_field('daemon_url', 'Daemon URL', [$this, 'field_daemon_url'], 'wp_opt_agents', 'wp_opt_agents_daemon');
         add_settings_field('daemon_log_level', 'Log Level', [$this, 'field_daemon_log_level'], 'wp_opt_agents', 'wp_opt_agents_daemon');
         add_settings_field('daemon_poll_interval_sec', 'Poll Interval (seconds)', [$this, 'field_daemon_poll_interval_sec'], 'wp_opt_agents', 'wp_opt_agents_daemon');
         add_settings_field('daemon_auto_retry_limit', 'Auto Retry Limit', [$this, 'field_daemon_auto_retry_limit'], 'wp_opt_agents', 'wp_opt_agents_daemon');
-        add_settings_field('daemon_api_token', 'Plugin Compatibility API Token', [$this, 'field_daemon_api_token'], 'wp_opt_agents', 'wp_opt_agents_daemon');
+        add_settings_field('daemon_api_token', 'Plugin/Daemon API Token', [$this, 'field_daemon_api_token'], 'wp_opt_agents', 'wp_opt_agents_daemon');
+        add_settings_field('notify_daemon_on_upload', 'Notify Daemon on Media Upload', [$this, 'field_notify_daemon_on_upload'], 'wp_opt_agents', 'wp_opt_agents_daemon');
     }
 
     public function sanitize_settings(array $input): array
@@ -190,6 +192,22 @@ class Settings
     {
         $settings = $this->settingsService->all();
         echo '<input type="text" name="wp_opt_agents_settings[daemon_api_token]" value="' . esc_attr((string)($settings['daemon_api_token'] ?? '')) . '" class="regular-text code" />';
-        echo '<p class="description">Optional token for plugin compatibility REST endpoints. Primary agent flow reads/writes WordPress DB directly.</p>';
+        echo '<p class="description">Bearer token for plugin↔daemon webhook/auth (e.g. /api/webhooks/media-upload).</p>';
+    }
+
+    public function field_daemon_url(): void
+    {
+        $settings = $this->settingsService->all();
+        $value = isset($settings['daemon_url']) ? (string)$settings['daemon_url'] : 'http://127.0.0.1:2095';
+        echo '<input type="text" name="wp_opt_agents_settings[daemon_url]" value="' . esc_attr($value) . '" class="regular-text code" placeholder="http://127.0.0.1:2095" />';
+        echo '<p class="description">Base URL of wp-offload-daemon (plugin will POST /api/webhooks/media-upload).</p>';
+    }
+
+    public function field_notify_daemon_on_upload(): void
+    {
+        $settings = $this->settingsService->all();
+        $checked = !empty($settings['notify_daemon_on_upload']) ? 'checked="checked"' : '';
+        echo "<input type=\"checkbox\" name=\"wp_opt_agents_settings[notify_daemon_on_upload]\" value=\"1\" {$checked} />";
+        echo '<p class="description">Send attachment + generated sizes to daemon on upload for imgbb backup/CDN replace/Blogger queue.</p>';
     }
 }

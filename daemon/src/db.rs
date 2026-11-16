@@ -393,6 +393,240 @@ impl Db {
             linked_at: r.get::<Option<String>,_>("linked_at").unwrap_or(None),
         }).collect())
     }
+
+    // --- Pipeline tables for imgbb backup + blogger queue + URL version history ---
+    pub fn url_versions_table(&self) -> String { self.cfg.t("wp_opt_agents_url_versions") }
+    pub fn blogger_queue_table(&self) -> String { self.cfg.t("wp_opt_agents_blogger_queue") }
+    pub fn cdn_map_table(&self) -> String { self.cfg.t("wp_opt_agents_cdn_map") }
+
+    pub async fn ensure_pipeline_tables(&self) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop(format!(r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                attachment_id BIGINT UNSIGNED NOT NULL,
+                image_size VARCHAR(64) NOT NULL,
+                provider VARCHAR(32) NOT NULL,
+                old_url TEXT NOT NULL,
+                old_url_hash CHAR(64) NOT NULL,
+                new_url TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_attachment_size (attachment_id, image_size),
+                KEY idx_provider (provider),
+                KEY idx_old_hash (old_url_hash)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#, self.url_versions_table())).await?;
+
+        conn.query_drop(format!(r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                attachment_id BIGINT UNSIGNED NOT NULL,
+                post_id BIGINT UNSIGNED DEFAULT NULL,
+                image_size VARCHAR(64) NOT NULL,
+                source_url TEXT NOT NULL,
+                local_path TEXT DEFAULT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'queued',
+                attempts INT NOT NULL DEFAULT 0,
+                last_error TEXT DEFAULT NULL,
+                blogger_url TEXT DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_status (status),
+                KEY idx_attachment_size (attachment_id, image_size),
+                KEY idx_post_id (post_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#, self.blogger_queue_table())).await?;
+
+        conn.query_drop(format!(r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                attachment_id BIGINT UNSIGNED NOT NULL,
+                image_size VARCHAR(64) NOT NULL,
+                wp_url TEXT NOT NULL,
+                wp_path VARCHAR(1024) NOT NULL,
+                cdn_path VARCHAR(1024) NOT NULL,
+                cdn_url TEXT NOT NULL,
+                target_provider VARCHAR(32) NOT NULL,
+                target_url TEXT NOT NULL,
+                agent_uuid VARCHAR(64) NOT NULL,
+                is_active TINYINT(1) NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uniq_attachment_size (attachment_id, image_size),
+                UNIQUE KEY uniq_cdn_path (cdn_path(191)),
+                KEY idx_wp_path (wp_path(191)),
+                KEY idx_provider (target_provider)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#, self.cdn_map_table())).await?;
+        Ok(())
+    }
+
+    pub async fn insert_url_version(&self, attachment_id: i64, image_size: &str, provider: &str, old_url: &str, new_url: &str) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        let old_hash = Self::hash_url(old_url);
+        conn.exec_drop(
+            format!("INSERT INTO {} (attachment_id, image_size, provider, old_url, old_url_hash, new_url) VALUES (:aid,:sz,:p,:o,:oh,:n)", self.url_versions_table()),
+            params!{"aid"=>attachment_id, "sz"=>image_size, "p"=>provider, "o"=>old_url, "oh"=>old_hash, "n"=>new_url}
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn upsert_cdn_mapping(&self, attachment_id: i64, image_size: &str, wp_url: &str, target_url: &str, provider: &str) -> Result<String> {
+        let mut conn = self.pool.get_conn().await?;
+        let wp_path = Self::uploads_rel_path_from_url(wp_url).unwrap_or_else(|| wp_url.trim_start_matches('/').to_string());
+        let agent_uuid = Self::short_uuid_for_url(wp_url, image_size);
+        let cdn_path = Self::pretty_cdn_path(&wp_path, &agent_uuid);
+        let cdn_url = format!("{}://{}/{}", self.cfg.cdn.scheme.trim_end_matches(':'), self.cfg.cdn.host.trim_end_matches('/'), cdn_path.trim_start_matches('/'));
+        conn.exec_drop(
+            format!(r#"
+                INSERT INTO {} (attachment_id, image_size, wp_url, wp_path, cdn_path, cdn_url, target_provider, target_url, agent_uuid, is_active)
+                VALUES (:aid,:sz,:wu,:wp,:cp,:cu,:prov,:tu,:uuid,1)
+                ON DUPLICATE KEY UPDATE
+                  wp_url=VALUES(wp_url),
+                  wp_path=VALUES(wp_path),
+                  cdn_path=VALUES(cdn_path),
+                  cdn_url=VALUES(cdn_url),
+                  target_provider=VALUES(target_provider),
+                  target_url=VALUES(target_url),
+                  agent_uuid=VALUES(agent_uuid),
+                  is_active=1,
+                  updated_at=CURRENT_TIMESTAMP
+            "#, self.cdn_map_table()),
+            params!{
+                "aid"=>attachment_id, "sz"=>image_size, "wu"=>wp_url, "wp"=>wp_path, "cp"=>cdn_path,
+                "cu"=>cdn_url.clone(), "prov"=>provider, "tu"=>target_url, "uuid"=>agent_uuid
+            }
+        ).await?;
+        Ok(cdn_url)
+    }
+
+    pub async fn set_cdn_target_latest_blogger(&self, attachment_id: i64, image_size: &str, blogger_url: &str) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop(
+            format!("UPDATE {} SET target_provider='blogger', target_url=:u, updated_at=CURRENT_TIMESTAMP WHERE attachment_id=:aid AND image_size=:sz", self.cdn_map_table()),
+            params!{"u"=>blogger_url, "aid"=>attachment_id, "sz"=>image_size}
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn get_cdn_target_by_path(&self, path: &str) -> Result<Option<String>> {
+        let mut conn = self.pool.get_conn().await?;
+        let norm = path.trim_start_matches('/');
+        // try exact cdn_path
+        let row: Option<(String,)> = conn.exec_first(
+            format!("SELECT target_url FROM {} WHERE cdn_path=:p AND is_active=1 LIMIT 1", self.cdn_map_table()),
+            params!{"p"=>norm}
+        ).await?;
+        if let Some((u,)) = row { return Ok(Some(u)); }
+        // try matching by wp_path (legacy WP URL path hitting CDN)
+        let row: Option<(String,)> = conn.exec_first(
+            format!("SELECT target_url FROM {} WHERE wp_path=:p AND is_active=1 ORDER BY updated_at DESC LIMIT 1", self.cdn_map_table()),
+            params!{"p"=>norm}
+        ).await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub fn uploads_rel_path_from_url(url: &str) -> Option<String> {
+        if let Some(idx) = url.find("/wp-content/uploads/") {
+            let rel = &url[idx + 1..]; // keep wp-content/uploads/...
+            return Some(rel.split('?').next().unwrap_or(rel).to_string());
+        }
+        None
+    }
+
+    fn pretty_cdn_path(wp_path: &str, agent_uuid: &str) -> String {
+        let p = std::path::Path::new(wp_path);
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+        let ext = p.extension().and_then(|e| e.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+        let parent = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+        let file = format!("{}-{}{}", stem, agent_uuid, ext);
+        if parent.is_empty() || parent == "." { file } else { format!("{}/{}", parent.trim_end_matches('/'), file) }
+    }
+
+    fn short_uuid_for_url(url: &str, image_size: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(url.as_bytes());
+        h.update(b"|");
+        h.update(image_size.as_bytes());
+        let hexs = hex::encode(h.finalize());
+        hexs[..12].to_string()
+    }
+
+    pub async fn enqueue_blogger_upload(&self, attachment_id: i64, post_id: Option<i64>, image_size: &str, source_url: &str, local_path: &str) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop(
+            format!("INSERT INTO {} (attachment_id, post_id, image_size, source_url, local_path, status) VALUES (:aid,:pid,:sz,:src,:lp,'queued')", self.blogger_queue_table()),
+            params!{"aid"=>attachment_id, "pid"=>post_id, "sz"=>image_size, "src"=>source_url, "lp"=>local_path}
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn get_queued_blogger_jobs(&self, limit: usize) -> Result<Vec<(i64,i64,Option<i64>,String,String,Option<String>)>> {
+        let mut conn = self.pool.get_conn().await?;
+        let rows: Vec<Row> = conn.exec(
+            format!("SELECT id, attachment_id, post_id, image_size, source_url, local_path FROM {} WHERE status='queued' ORDER BY id ASC LIMIT :lim", self.blogger_queue_table()),
+            params!{"lim"=> limit as u64}
+        ).await?;
+        Ok(rows.into_iter().map(|r| (
+            r.get::<i64,_>("id").unwrap_or(0),
+            r.get::<i64,_>("attachment_id").unwrap_or(0),
+            r.get::<Option<i64>,_>("post_id").unwrap_or(None),
+            r.get::<String,_>("image_size").unwrap_or_default(),
+            r.get::<String,_>("source_url").unwrap_or_default(),
+            r.get::<Option<String>,_>("local_path").unwrap_or(None),
+        )).collect())
+    }
+
+    pub async fn mark_blogger_job_status(&self, id: i64, status: &str, blogger_url: Option<&str>, err: Option<&str>) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop(
+            format!("UPDATE {} SET status=:s, blogger_url=:b, last_error=:e, attempts=attempts+1, updated_at=CURRENT_TIMESTAMP WHERE id=:id", self.blogger_queue_table()),
+            params!{"s"=>status, "b"=>blogger_url, "e"=>err, "id"=>id}
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn get_latest_url_for_size(&self, attachment_id: i64, image_size: &str, provider: &str) -> Result<Option<String>> {
+        let mut conn = self.pool.get_conn().await?;
+        let row: Option<(String,)> = conn.exec_first(
+            format!("SELECT new_url FROM {} WHERE attachment_id=:aid AND image_size=:sz AND provider=:p ORDER BY id DESC LIMIT 1", self.url_versions_table()),
+            params!{"aid"=>attachment_id, "sz"=>image_size, "p"=>provider}
+        ).await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn find_posts_using_urls(&self, urls: &[String]) -> Result<Vec<i64>> {
+        if urls.is_empty() { return Ok(vec![]); }
+        let mut conn = self.pool.get_conn().await?;
+        let mut ids = std::collections::HashSet::new();
+        for u in urls {
+            let rows: Vec<(i64,)> = conn.exec(
+                format!("SELECT ID FROM {} WHERE post_content LIKE :like AND post_type='post'", self.posts_table()),
+                params!{"like"=>format!("%{}%", u)}
+            ).await?;
+            for (id,) in rows { ids.insert(id); }
+        }
+        let mut v: Vec<i64> = ids.into_iter().collect();
+        v.sort();
+        Ok(v)
+    }
+
+    pub async fn replace_urls_in_posts_by_in(&self, replacements: &[(String,String)]) -> Result<usize> {
+        if replacements.is_empty() { return Ok(0); }
+        let urls: Vec<String> = replacements.iter().map(|(o,_)| o.clone()).collect();
+        let post_ids = self.find_posts_using_urls(&urls).await?;
+        let mut total = 0usize;
+        for pid in post_ids {
+            total += self.replace_urls_in_post_content(pid, replacements, self.cfg.agent.backup_before_replace).await?;
+        }
+        Ok(total)
+    }
+
+
+
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -69,11 +69,13 @@ class SettingsService
             'backup_before_rewrite' => true,
             'enable_old_url_redirect_301' => true,
             'daemon_port' => 2095,
+            'daemon_url' => 'http://127.0.0.1:2095',
             'daemon_log_level' => 'info',
             'daemon_worker_threads' => 4,
             'daemon_poll_interval_sec' => 60,
             'daemon_auto_retry_limit' => 3,
             'daemon_api_token' => '',
+            'notify_daemon_on_upload' => true,
         ];
     }
 
@@ -114,8 +116,10 @@ class SettingsService
             ],
             'daemon' => [
                 'port' => (int)$settings['daemon_port'],
+                'url' => (string)$settings['daemon_url'],
                 'poll_interval_sec' => (int)$settings['daemon_poll_interval_sec'],
                 'auto_retry_limit' => (int)$settings['daemon_auto_retry_limit'],
+                'notify_on_upload' => (bool)$settings['notify_daemon_on_upload'],
             ],
         ];
     }

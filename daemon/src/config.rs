@@ -10,6 +10,10 @@ pub struct Config {
     pub chrome: ChromeConfig,
     pub agent: AgentConfig,
     #[serde(default)]
+    pub imgbb: ImgbbConfig,
+    #[serde(default)]
+    pub cdn: CdnConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -81,6 +85,28 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ImgbbConfig {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct CdnConfig {
+    #[serde(default = "default_cdn_host")]
+    pub host: String,
+    #[serde(default = "default_cdn_scheme")]
+    pub scheme: String,
+}
+
+impl Default for CdnConfig {
+    fn default() -> Self {
+        Self { host: default_cdn_host(), scheme: default_cdn_scheme() }
+    }
+}
+
 fn default_upload_via() -> String { "chrome_web_ui".into() }
 fn default_profile_dir() -> String { "Default".into() }
 fn default_debug_port() -> u16 { 9222 }
@@ -90,6 +116,8 @@ fn default_agent_port() -> u16 { 2095 }
 fn default_poll() -> u64 { 60 }
 fn default_true() -> bool { true }
 fn default_log_level() -> String { "info".into() }
+fn default_cdn_scheme() -> String { "https".into() }
+fn default_cdn_host() -> String { "cdn.nghesachxua.localhost".into() }
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
@@ -130,6 +158,8 @@ impl Config {
             blogger: BloggerConfig { blog_id: String::new(), upload_via: default_upload_via(), one_wp_post_per_blogger_post: true },
             chrome: ChromeConfig { executable: None, user_data_dir: None, profile_directory: default_profile_dir(), headless: false, remote_debugging_port: default_debug_port(), launch_timeout_secs: default_launch_timeout() },
             agent: AgentConfig { host: default_host(), port: default_agent_port(), poll_interval_secs: default_poll(), replace_in_db: true, enable_old_url_redirect_301: true, backup_before_replace: true, daemon_api_token: String::new() },
+            imgbb: ImgbbConfig { api_key: String::new(), enabled: true },
+            cdn: CdnConfig::default(),
             logging: LoggingConfig { level: default_log_level() },
         };
         cfg.normalize();
