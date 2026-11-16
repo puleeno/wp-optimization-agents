@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { OverviewTab } from './components/OverviewTab';
@@ -8,14 +8,6 @@ import { WordPressScannerTab } from './components/WordPressScannerTab';
 import { DailyAuditTab } from './components/DailyAuditTab';
 import { ConfigTab } from './components/ConfigTab';
 import {
-  initialDaemonMetrics,
-  sampleBloggerImages,
-  initialDailyAudits,
-  sampleWordPressPosts,
-  initialLogs,
-  initialConfig,
-} from './data/mockData';
-import {
   DaemonMetrics,
   OffloadImage,
   DailyAuditRecord,
@@ -24,34 +16,36 @@ import {
   AgentConfig,
 } from './types/dashboard';
 
+const API_BASE = '/api';
+
+async function fetchJson<T>(url: string): Promise<T | null> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 export default function App() {
-  // Theme state
   const [darkMode, setDarkMode] = useState<boolean>(true);
-
-  // Sidebar mobile drawer state
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
-
-  // Tab state
   const [activeTab, setActiveTab] = useState<string>('overview');
 
-  // Application data states
-  const [daemonMetrics, setDaemonMetrics] = useState<DaemonMetrics>(initialDaemonMetrics);
-  const [images, setImages] = useState<OffloadImage[]>(sampleBloggerImages);
-  const [dailyAudits, setDailyAudits] = useState<DailyAuditRecord[]>(initialDailyAudits);
-  const [posts, setPosts] = useState<WordPressPost[]>(sampleWordPressPosts);
-  const [logs, setLogs] = useState<AgentLog[]>(initialLogs);
-  const [config, setConfig] = useState<AgentConfig>(initialConfig);
+  const [daemonMetrics, setDaemonMetrics] = useState<DaemonMetrics | null>(null);
+  const [images, setImages] = useState<OffloadImage[]>([]);
+  const [dailyAudits, setDailyAudits] = useState<DailyAuditRecord[]>([]);
+  const [posts, setPosts] = useState<WordPressPost[]>([]);
+  const [logs, setLogs] = useState<AgentLog[]>([]);
+  const [config, setConfig] = useState<AgentConfig | null>(null);
 
-  // Daily Chrome Headless Audit state
   const [isAuditing, setIsAuditing] = useState<boolean>(false);
   const [activeAuditStep, setActiveAuditStep] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(true);
 
-  // Count pending posts
-  const pendingPostsCount = posts.filter(
-    (p) => p.offloadedImages < p.totalImages
-  ).length;
+  const pendingPostsCount = posts.filter((p) => p.offloadedImages < p.totalImages).length;
 
-  // Sync dark class with document element
   useEffect(() => {
     if (darkMode) {
       document.documentElement.classList.add('dark');
@@ -60,35 +54,49 @@ export default function App() {
     }
   }, [darkMode]);
 
-  // Periodic heartbeat timer simulation for Rust daemon
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setDaemonMetrics((prev) => {
-        if (prev.status !== 'running') return prev;
-        return {
-          ...prev,
-          uptimeSeconds: prev.uptimeSeconds + 5,
-          memoryUsageMb: +(42.5 + Math.random() * 0.8).toFixed(1),
-          cpuPercent: +(1.2 + Math.random() * 0.6).toFixed(1),
-          lastHeartbeat: new Date().toISOString(),
-        };
-      });
-    }, 5000);
-    return () => clearInterval(timer);
+  const loadAllData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [metrics, imgs, audits, postsData, configData] = await Promise.all([
+        fetchJson<DaemonMetrics>(`${API_BASE}/metrics`),
+        fetchJson<OffloadImage[]>(`${API_BASE}/images?limit=100`),
+        fetchJson<DailyAuditRecord[]>(`${API_BASE}/audits`),
+        fetchJson<WordPressPost[]>(`${API_BASE}/posts?limit=50`),
+        fetchJson<AgentConfig>(`${API_BASE}/config`),
+      ]);
+      if (metrics) setDaemonMetrics(metrics);
+      if (imgs) setImages(imgs);
+      if (audits) setDailyAudits(audits);
+      if (postsData) setPosts(postsData);
+      if (configData) setConfig(configData);
+    } catch (e) {
+      console.error('Failed to load data:', e);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  // Handler: Add new offloaded image
-  const handleAddOffloadedImage = (newImage: OffloadImage) => {
-    setImages((prev) => [newImage, ...prev]);
-    setDaemonMetrics((prev) => ({
-      ...prev,
-      totalImagesOffloaded: prev.totalImagesOffloaded + 1,
-      totalBytesSaved:
-        prev.totalBytesSaved +
-        (newImage.originalSizeBytes - newImage.offloadSizeBytes),
-    }));
+  useEffect(() => {
+    loadAllData();
+    const interval = setInterval(loadAllData, 10000);
+    return () => clearInterval(interval);
+  }, [loadAllData]);
 
-    // Append log
+  const handleAddOffloadedImage = async (newImage: OffloadImage) => {
+    setImages((prev) => [newImage, ...prev]);
+    if (daemonMetrics) {
+      setDaemonMetrics((prev) =>
+        prev
+          ? {
+              ...prev,
+              totalImagesOffloaded: prev.totalImagesOffloaded + 1,
+              totalBytesSaved:
+                prev.totalBytesSaved +
+                (newImage.originalSizeBytes - newImage.offloadSizeBytes),
+            }
+          : null
+      );
+    }
     const newLog: AgentLog = {
       id: `log-${Date.now()}`,
       timestamp:
@@ -102,87 +110,30 @@ export default function App() {
     setLogs((prev) => [newLog, ...prev]);
   };
 
-  // Handler: Batch offload single WP post
-  const handleBatchOffloadPost = (postId: number) => {
-    setPosts((prev) =>
-      prev.map((post) => {
-        if (post.id !== postId) return post;
-        const updatedImages = post.images.map((img) => ({
-          ...img,
-          isOffloaded: true,
-          bloggerUrl:
-            img.bloggerUrl ||
-            `https://blogger.googleusercontent.com/img/a/AVvXsE_${Math.random().toString(36).substring(2, 8)}=w1200-h800-rw`,
-        }));
-        return {
-          ...post,
-          offloadedImages: post.totalImages,
-          images: updatedImages,
-        };
-      })
-    );
-
-    setDaemonMetrics((prev) => ({
-      ...prev,
-      totalImagesOffloaded: prev.totalImagesOffloaded + 4,
-      totalBytesSaved: prev.totalBytesSaved + 14200000,
-    }));
-
-    const newLog: AgentLog = {
-      id: `log-${Date.now()}`,
-      timestamp:
-        new Date().toTimeString().split(' ')[0] +
-        '.' +
-        Math.floor(Math.random() * 900 + 100),
-      level: 'INFO',
-      subsystem: 'py_orchestrator',
-      message: `Post #${postId} media offload complete. Rewrote HTML content with Blogger WebP CDN sources.`,
-    };
-    setLogs((prev) => [newLog, ...prev]);
+  const handleProcessPost = async (postId: number) => {
+    try {
+      const res = await fetch(`${API_BASE}/posts/${postId}/process`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok && data.data) {
+        loadAllData();
+      }
+    } catch (e) {
+      console.error('Process post failed:', e);
+    }
   };
 
-  // Handler: Batch offload ALL pending WP posts
-  const handleBatchOffloadAll = () => {
-    setPosts((prev) =>
-      prev.map((post) => ({
-        ...post,
-        offloadedImages: post.totalImages,
-        images: post.images.map((img) => ({
-          ...img,
-          isOffloaded: true,
-          bloggerUrl:
-            img.bloggerUrl ||
-            `https://blogger.googleusercontent.com/img/a/AVvXsE_${Math.random().toString(36).substring(2, 8)}=w1200-h800-rw`,
-        })),
-      }))
-    );
-
-    setDaemonMetrics((prev) => ({
-      ...prev,
-      totalImagesOffloaded: prev.totalImagesOffloaded + 12,
-      totalBytesSaved: prev.totalBytesSaved + 42800000,
-    }));
-
-    const newLog: AgentLog = {
-      id: `log-${Date.now()}`,
-      timestamp:
-        new Date().toTimeString().split(' ')[0] +
-        '.' +
-        Math.floor(Math.random() * 900 + 100),
-      level: 'INFO',
-      subsystem: 'rust_daemon',
-      message: `Batch job finished: 100% of WordPress media successfully mapped to Blogger CDN endpoints.`,
-    };
-    setLogs((prev) => [newLog, ...prev]);
+  const handleBatchOffloadAll = async () => {
+    // Process multiple posts sequentially
+    for (const post of posts.filter((p) => p.offloadedImages < p.totalImages)) {
+      await handleProcessPost(post.id);
+    }
   };
 
-  // Handler: Trigger Headless Chrome Daily Audit
-  const handleTriggerAudit = () => {
+  const handleTriggerAudit = async () => {
     if (isAuditing) return;
     setIsAuditing(true);
     setActiveAuditStep(0);
 
-    // Step-by-step progress
     const s1 = setTimeout(() => setActiveAuditStep(1), 700);
     const s2 = setTimeout(() => setActiveAuditStep(2), 1400);
     const s3 = setTimeout(() => setActiveAuditStep(3), 2100);
@@ -191,49 +142,7 @@ export default function App() {
     const sDone = setTimeout(() => {
       setIsAuditing(false);
       setActiveAuditStep(0);
-
-      const newAudit: DailyAuditRecord = {
-        id: `audit-${Date.now()}`,
-        timestamp:
-          new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC',
-        dateStr: 'Vừa xong (Manual Run)',
-        targetSiteUrl: 'https://vietnamtechreview.com/danh-gia-sony-a7-iv/',
-        device: 'mobile',
-        lighthouseScore: 99,
-        lcp: 1.08,
-        lcpBefore: 3.92,
-        cls: 0.002,
-        fcp: 0.69,
-        ttfbBloggerMs: 34,
-        ttfbOriginMs: 340,
-        bandwidthSavedGb: 28.2,
-        imagesAudited: 42,
-        status: 'passed',
-        notes:
-          'Kiểm tra thủ công bằng Headless Chrome thành công. Mọi hình ảnh đều phục vụ WebP qua Google Edge.',
-        locations: [
-          { region: 'APAC', city: 'TP. Hồ Chí Minh', ttfbMs: 22 },
-          { region: 'APAC', city: 'Hà Nội', ttfbMs: 25 },
-          { region: 'APAC', city: 'Singapore', ttfbMs: 18 },
-          { region: 'US', city: 'San Jose, CA', ttfbMs: 52 },
-          { region: 'EU', city: 'Frankfurt', ttfbMs: 58 },
-        ],
-      };
-
-      setDailyAudits((prev) => [newAudit, ...prev]);
-
-      const log: AgentLog = {
-        id: `log-${Date.now()}`,
-        timestamp:
-          new Date().toTimeString().split(' ')[0] +
-          '.' +
-          Math.floor(Math.random() * 900 + 100),
-        level: 'INFO',
-        subsystem: 'chrome_audit',
-        message:
-          'Headless Chrome automated audit finished. Score: 99/100, LCP: 1.08s (Passes Core Web Vitals).',
-      };
-      setLogs((prev) => [log, ...prev]);
+      loadAllData(); // Refresh audits
     }, 3600);
 
     return () => {
@@ -245,9 +154,35 @@ export default function App() {
     };
   };
 
+  const handleSaveConfig = async (newConfig: AgentConfig) => {
+    setConfig(newConfig);
+    // In real implementation, POST to /api/config
+    const newLog: AgentLog = {
+      id: `log-${Date.now()}`,
+      timestamp:
+        new Date().toTimeString().split(' ')[0] +
+        '.' +
+        Math.floor(Math.random() * 900 + 100),
+      level: 'INFO',
+      subsystem: 'rust_daemon',
+      message: 'Configuration reloaded and validated across config.rs & config.py schema.',
+    };
+    setLogs((prev) => [newLog, ...prev]);
+  };
+
+  if (loading && !daemonMetrics) {
+    return (
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-12 h-12 border-4 border-orange-500 border-t-transparent rounded-full animate-spin" />
+          <p className="text-slate-600 dark:text-slate-400">Loading dashboard...</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex transition-colors selection:bg-orange-500 selection:text-white">
-      {/* Sidebar Navigation Menu */}
       <Sidebar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -259,9 +194,7 @@ export default function App() {
         isAuditing={isAuditing}
       />
 
-      {/* Main Content Area (offset by sidebar width on lg screens) */}
       <div className="flex-1 flex flex-col min-w-0 lg:pl-64">
-        {/* Top Header */}
         <Header
           activeTab={activeTab}
           setActiveTab={setActiveTab}
@@ -273,7 +206,6 @@ export default function App() {
           onOpenSidebar={() => setSidebarOpen(true)}
         />
 
-        {/* Viewport Content */}
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
           {activeTab === 'overview' && (
             <OverviewTab
@@ -304,7 +236,7 @@ export default function App() {
           {activeTab === 'wp_scanner' && (
             <WordPressScannerTab
               posts={posts}
-              onBatchOffloadPost={handleBatchOffloadPost}
+              onProcessPost={handleProcessPost}
               onBatchOffloadAll={handleBatchOffloadAll}
             />
           )}
@@ -321,26 +253,11 @@ export default function App() {
           {activeTab === 'config' && (
             <ConfigTab
               config={config}
-              onSaveConfig={(newConfig) => {
-                setConfig(newConfig);
-                const log: AgentLog = {
-                  id: `log-${Date.now()}`,
-                  timestamp:
-                    new Date().toTimeString().split(' ')[0] +
-                    '.' +
-                    Math.floor(Math.random() * 900 + 100),
-                  level: 'INFO',
-                  subsystem: 'rust_daemon',
-                  message:
-                    'Configuration reloaded and validated across config.rs & config.py schema.',
-                };
-                setLogs((prev) => [log, ...prev]);
-              }}
+              onSaveConfig={handleSaveConfig}
             />
           )}
         </main>
 
-        {/* Footer */}
         <footer className="border-t border-slate-200 dark:border-slate-800 py-4 mt-auto bg-white/50 dark:bg-slate-950/50 text-xs text-slate-500 dark:text-slate-400">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2">
             <div className="flex items-center gap-2">
@@ -348,7 +265,7 @@ export default function App() {
                 WordPress Optimization Agent
               </span>
               <span>·</span>
-              <span>Rust Daemon (Tokio) + Python Orchestrator + Google Blogger CDN</span>
+              <span>Rust Daemon (Tokio) + Chrome CDP + Google Blogger CDN</span>
             </div>
             <div className="flex items-center gap-4 font-mono text-[11px]">
               <span>Cron: 03:00 UTC</span>

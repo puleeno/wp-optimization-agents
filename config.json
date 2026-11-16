@@ -26,12 +26,12 @@
   },
   "agent": {
     "host": "127.0.0.1",
-    "port": 2095,
+    "port": 2096,
     "poll_interval_secs": 60,
     "replace_in_db": true,
     "backup_before_replace": true,
     "enable_old_url_redirect_301": true,
-    "daemon_api_token": "CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32"
+    "daemon_api_token": "8c39ec362bfa709fb4957163b73bb386639a967fe438bcbbc4ed5fc6c386f2d8"
   },
   "logging": {
     "level": "info",

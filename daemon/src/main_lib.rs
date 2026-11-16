@@ -118,6 +118,7 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/images", get(list_images))
         .route("/api/posts", get(list_posts))
         .route("/api/logs", get(list_logs))
+        .route("/api/audits", get(list_audits))
         .route("/api/config", get(get_config))
         .route("/api/posts/:id/process", post(process_post))
         .with_state(state.clone());
@@ -200,7 +201,7 @@ async fn list_images(State(state): State<AppState>, Query(q): Query<ListQuery>) 
             status: im.status,
             error_message: im.error_message,
             redirect_active: im.redirect_active != 0,
-            replaced_at: im.replaced_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)),
+            replaced_at: im.replaced_at.and_then(|s: String| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)),
             created_at: im.created_at,
             updated_at: im.updated_at,
         }).collect()),
@@ -229,7 +230,7 @@ async fn list_posts(State(state): State<AppState>, Query(q): Query<ListQuery>) -
             blogger_post_id: p.blogger_post_id,
             blogger_post_url: p.blogger_post_url,
             blogger_blog_id: p.blogger_blog_id,
-            linked_at: p.linked_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)),
+            linked_at: p.linked_at.and_then(|s: String| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)),
         }).collect()),
         Err(e) => {
             tracing::error!("list_posts failed: {}", e);
@@ -242,6 +243,38 @@ async fn list_logs(State(_state): State<AppState>) -> impl IntoResponse {
     // Return recent structured logs - for now return empty
     // In production, this would query a log store or in-memory buffer
     Json(Vec::<LogEntry>::new())
+}
+
+async fn list_audits(State(_state): State<AppState>) -> impl IntoResponse {
+    Json(Vec::<DailyAuditRecord>::new())
+}
+
+#[derive(Serialize)]
+struct DailyAuditRecord {
+    id: String,
+    timestamp: String,
+    date_str: String,
+    target_site_url: String,
+    device: String,
+    lighthouse_score: u32,
+    lcp: f64,
+    lcp_before: f64,
+    cls: f64,
+    fcp: f64,
+    ttfb_blogger_ms: u32,
+    ttfb_origin_ms: u32,
+    bandwidth_saved_gb: f64,
+    images_audited: u32,
+    status: String,
+    notes: String,
+    locations: Vec<AuditLocation>,
+}
+
+#[derive(Serialize)]
+struct AuditLocation {
+    region: String,
+    city: String,
+    ttfb_ms: u32,
 }
 
 async fn get_config(State(state): State<AppState>) -> impl IntoResponse {

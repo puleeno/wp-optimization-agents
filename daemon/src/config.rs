@@ -71,6 +71,8 @@ pub struct AgentConfig {
     pub enable_old_url_redirect_301: bool,
     #[serde(default = "default_true")]
     pub backup_before_replace: bool,
+    #[serde(default)]
+    pub daemon_api_token: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -127,7 +129,7 @@ impl Config {
             },
             blogger: BloggerConfig { blog_id: String::new(), upload_via: default_upload_via(), one_wp_post_per_blogger_post: true },
             chrome: ChromeConfig { executable: None, user_data_dir: None, profile_directory: default_profile_dir(), headless: false, remote_debugging_port: default_debug_port(), launch_timeout_secs: default_launch_timeout() },
-            agent: AgentConfig { host: default_host(), port: default_agent_port(), poll_interval_secs: default_poll(), replace_in_db: true, enable_old_url_redirect_301: true, backup_before_replace: true },
+            agent: AgentConfig { host: default_host(), port: default_agent_port(), poll_interval_secs: default_poll(), replace_in_db: true, enable_old_url_redirect_301: true, backup_before_replace: true, daemon_api_token: String::new() },
             logging: LoggingConfig { level: default_log_level() },
         };
         cfg.normalize();

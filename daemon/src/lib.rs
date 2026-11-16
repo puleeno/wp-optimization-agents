@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod main_lib;
 pub mod offload;
+pub mod wp_api;
 
 pub use config::Config;
 pub use error::{Error, Result};

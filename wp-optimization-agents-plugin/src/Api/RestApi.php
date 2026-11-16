@@ -74,6 +74,12 @@ class RestApi
             'permission_callback' => [$this, 'check_daemon_permission'],
         ]);
 
+        register_rest_route($namespace, '/images/(?P<id>\d+)/sizes', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_image_sizes'],
+            'permission_callback' => [$this, 'check_daemon_permission'],
+        ]);
+
         register_rest_route($namespace, '/posts/(?P<id>\d+)/replace-content', [
             'methods' => 'POST',
             'callback' => [$this, 'replace_post_content'],
@@ -105,11 +111,15 @@ class RestApi
     }
 
     /**
-     * Daemon authenticates with plugin token (compatibility endpoint). Rust agent may also read WP DB directly.
+     * Daemon authenticates with plugin token. Admin UI users authenticate via WP session.
      * @return bool|WP_Error
      */
     public function check_daemon_permission(WP_REST_Request $request)
     {
+        if (current_user_can('manage_options')) {
+            return true;
+        }
+
         $auth_header = $request->get_header('Authorization');
         if (!$auth_header) {
             return new WP_Error('missing_auth', 'Authorization header required', ['status' => 401]);
@@ -221,6 +231,33 @@ class RestApi
         return $this->respond($result
             ? ApiResponse::success(['failed' => true, 'image_id' => $image_id])
             : ApiResponse::error('Failed to update image', 500));
+    }
+
+    public function get_image_sizes(WP_REST_Request $request): WP_REST_Response
+    {
+        $image_id = (int)$request->get_param('id');
+        $image = $this->imageRepository->find_by_id($image_id);
+        if (!$image) {
+            return $this->respond(ApiResponse::error('Image not found', 404));
+        }
+        
+        $sizes = [];
+        if (!empty($image['metadata']) && is_array($image['metadata'])) {
+            if (isset($image['metadata']['sizes']) && is_array($image['metadata']['sizes'])) {
+                $sizes = $image['metadata']['sizes'];
+            }
+        }
+        
+        return $this->respond(ApiResponse::success([
+            'image_id' => $image['id'],
+            'origin_url' => $image['origin_url'],
+            'attachment_id' => $image['attachment_id'] ?? null,
+            'width' => $image['width'] ?? null,
+            'height' => $image['height'] ?? null,
+            'file_size' => $image['file_size'] ?? null,
+            'mime_type' => $image['mime_type'] ?? null,
+            'sizes' => $sizes,
+        ]));
     }
 
     public function replace_post_content(WP_REST_Request $request): WP_REST_Response

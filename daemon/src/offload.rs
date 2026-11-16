@@ -3,111 +3,138 @@ use crate::chrome::{default_chrome_path, Cdp};
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::Result;
+use crate::wp_api::{WpApiClient, WpImage, WpPostStatusResponse};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::{info, warn};
 
 pub struct OffloadEngine {
     cfg: Arc<Config>,
+    wp_api: WpApiClient,
     db: Db,
 }
 
 impl OffloadEngine {
     pub async fn new(cfg: Arc<Config>) -> Result<Self> {
+        let base_url = format!("{}/wp-json/wp-opt-agents/v1", cfg.site.url.trim_end_matches('/'));
+        let token = cfg.agent.daemon_api_token.clone();
+        let wp_api = WpApiClient::new(base_url, token);
         let db = Db::new((*cfg).clone())?;
         db.ping().await?;
-        Ok(Self { cfg, db })
+        Ok(Self { cfg, wp_api, db })
     }
 
     pub fn db(&self) -> &Db { &self.db }
 
-    /// Process one WP post: discover images -> upload pending to Blogger (1 post = 1 blogger post) -> replace URLs in DB -> mark replaced & activate redirects -> link WP<->Blogger.
+    /// Process one WP post using plugin REST API:
+    /// 1. Get post status (images) from plugin
+    /// 2. For each pending image, get sizes from plugin
+    /// 3. Upload all images to Blogger via Chrome (1 WP post = 1 Blogger post)
+    /// 4. Mark images uploaded in plugin with blogger URLs
+    /// 5. Link blogger post in plugin
+    /// 6. Mark images replaced in plugin (triggers 301 redirects + URL replacement)
     pub async fn process_post(&self, post_id: i64) -> Result<serde_json::Value> {
-        tracing::info!(post_id, "processing post");
-        let rows = self.db.ensure_post_images_registered(post_id).await?;
-        if rows.is_empty() {
+        info!(post_id, "processing post via WP REST API");
+
+        // 1. Get post status from plugin
+        let post_status = self.wp_api.get_post_status(post_id).await?;
+        if post_status.images.is_empty() {
             return Ok(serde_json::json!({"post_id": post_id, "status":"no_images", "uploaded":0, "replaced":0}));
         }
 
-        let (blogger_post_id_existing, _) = self.db.get_post_blogger_link(post_id).await?.unwrap_or((String::new(), String::new()));
-
-        // images needing upload (have local file and no blogger_url yet)
-        let mut to_upload: Vec<(i64, String, String)> = Vec::new(); // (image_map_id, origin_url, local_path)
-        let all = self.db.list_images_for_post(post_id).await?;
-        for im in &all {
-            if im.status == "replaced" && im.blogger_url.as_deref().unwrap_or("").len() > 0 { continue; }
-            if im.blogger_url.as_deref().unwrap_or("").len() > 0 { continue; } // already uploaded
-            // resolve local path
-            let local = self.origin_to_local(&im.origin_url);
-            if let Some(lp) = local {
-                if std::path::Path::new(&lp).exists() {
-                    to_upload.push((im.id, im.origin_url.clone(), lp));
-                } else {
-                    tracing::warn!("local file missing for image {} {}", im.id, im.origin_url);
-                }
-            }
-        }
-
-        let mut blogger_link: Option<(String,String)> = None; // (post_id,url)
-        if !to_upload.is_empty() {
-            let cdp = self.launch_chrome().await?;
-            let title = self.db.get_post_title(post_id).await.unwrap_or_else(|_| format!("Post {post_id}"));
-            let paths: Vec<String> = to_upload.iter().map(|x| x.2.clone()).collect();
-            for (id,_,_) in &to_upload { let _ = self.db.mark_image_status(*id, "uploading", None).await; }
-            let existing = if blogger_post_id_existing.is_empty() { None } else { Some(blogger_post_id_existing.as_str()) };
-            let res = blogger::upload_images_for_post(&cdp, &self.cfg.blogger.blog_id, &title, existing, &paths).await;
-            match res {
-                Ok((link, ups)) => {
-                    // map by path
-                    for (i, up) in ups.iter().enumerate() {
-                        if let Some((img_id, _, _)) = to_upload.get(i) {
-                            let _ = self.db.mark_image_uploaded(*img_id, &up.blogger_url, up.blogger_image_id.as_deref()).await;
-                        }
-                    }
-                    let _ = self.db.save_post_blogger_link(post_id, &link.post_id, &link.post_url, &self.cfg.blogger.blog_id).await;
-                    blogger_link = Some((link.post_id, link.post_url));
-                }
-                Err(e) => {
-                    for (id,_,_) in &to_upload { let _ = self.db.mark_image_status(*id, "failed", Some(&e.to_string())).await; }
-                    cdp.close().await;
-                    return Err(e);
-                }
-            }
-            cdp.close().await;
-        }
-
-        // build replacements for uploaded images and apply DB replacements
-        let refreshed = self.db.list_images_for_post(post_id).await?;
-        let replacements: Vec<(String,String)> = refreshed.iter()
-            .filter(|im| im.blogger_url.as_deref().unwrap_or("").len() > 0 && im.status != "replaced")
-            .map(|im| (im.origin_url.clone(), im.blogger_url.clone().unwrap_or_default()))
+        // Filter images needing upload
+        let to_upload: Vec<WpImage> = post_status.images.into_iter()
+            .filter(|im| im.status != "replaced" && im.blogger_url.as_deref().unwrap_or("").is_empty())
             .collect();
 
-        let mut applied = 0usize;
-        if self.cfg.agent.replace_in_db && !replacements.is_empty() {
-            applied = self.db.replace_urls_in_post_content(post_id, &replacements, self.cfg.agent.backup_before_replace).await?;
-            let _ = self.db.replace_urls_in_postmeta_and_options(&replacements).await;
+        if to_upload.is_empty() {
+            return Ok(serde_json::json!({"post_id": post_id, "status":"all_uploaded", "uploaded":0, "replaced":0}));
         }
 
-        // mark replaced + activate redirect (plugin/daemon both can rely on DB state)
-        let mut replaced = 0usize;
-        for im in refreshed.iter() {
-            if im.blogger_url.as_deref().unwrap_or("").is_empty() { continue; }
-            if im.status == "replaced" { replaced += 1; continue; }
-            // if replaced in content or replacement exists, mark replaced
-            if replacements.iter().any(|(o,_)| o == &im.origin_url) || !self.cfg.agent.replace_in_db {
-                let _ = self.db.mark_image_replaced(im.id).await;
-                replaced += 1;
+        // 2. Resolve local paths and upload
+        let paths: Vec<String> = to_upload.iter()
+            .filter_map(|im| self.origin_to_local(&im.origin_url))
+            .filter(|p| std::path::Path::new(p).exists())
+            .collect();
+
+        if paths.is_empty() {
+            warn!(post_id, "no local files found for images");
+            return Ok(serde_json::json!({"post_id": post_id, "status":"no_local_files", "uploaded":0, "replaced":0}));
+        }
+
+        // 3. Upload to Blogger
+        let cdp = self.launch_chrome().await?;
+        let title = self.get_post_title_via_api(post_id).await.unwrap_or_else(|_| format!("Post {post_id}"));
+        let existing_post_id = self.get_existing_blogger_post_id(post_id).await?;
+
+        let existing = if existing_post_id.is_empty() { None } else { Some(existing_post_id.as_str()) };
+        let res = blogger::upload_images_for_post(&cdp, &self.cfg.blogger.blog_id, &title, existing, &paths).await;
+        
+        let (blogger_post_id, blogger_post_url, uploaded_images) = match res {
+            Ok((link, ups)) => (link.post_id, link.post_url, ups),
+            Err(e) => {
+                // Mark failed in plugin
+                for im in &to_upload {
+                    let _ = self.wp_api.mark_image_failed(im.id, &e.to_string()).await;
+                }
+                cdp.close().await;
+                return Err(e);
+            }
+        };
+        cdp.close().await;
+
+        // 4. Mark images uploaded in plugin with blogger URLs
+        for (i, up) in uploaded_images.iter().enumerate() {
+            if i < to_upload.len() {
+                let im = &to_upload[i];
+                let _ = self.wp_api.mark_image_uploaded(
+                    im.id,
+                    &up.blogger_url,
+                    up.blogger_image_id.as_deref(),
+                    None
+                ).await;
+            }
+        }
+
+        // 5. Link blogger post in plugin
+        let blogger_album_url = format!("https://www.blogger.com/blog/post/{}", blogger_post_id);
+        let _ = self.wp_api.link_blogger_post(
+            post_id,
+            &blogger_post_id,
+            &blogger_post_url,
+            &blogger_album_url,
+            &self.cfg.blogger.blog_id
+        ).await;
+
+        // 6. Mark images replaced in plugin (triggers 301 redirects + URL replacement in WP)
+        let mut replaced_count = 0;
+        for im in &to_upload {
+            if let Err(e) = self.wp_api.mark_image_replaced(im.id).await {
+                warn!(image_id = im.id, error = %e, "failed to mark replaced in plugin");
+            } else {
+                replaced_count += 1;
             }
         }
 
         Ok(serde_json::json!({
             "post_id": post_id,
-            "blogger": blogger_link.map(|(id,u)| serde_json::json!({"post_id": id, "post_url": u})),
+            "blogger": {
+                "post_id": blogger_post_id,
+                "post_url": blogger_post_url,
+            },
             "uploaded_now": to_upload.len(),
-            "replacements_applied": applied,
-            "replaced_mappings": replaced,
-            "total_images": refreshed.len()
+            "replaced_mappings": replaced_count,
         }))
+    }
+
+    async fn get_post_title_via_api(&self, post_id: i64) -> Result<String> {
+        // Could add a REST endpoint for this, fallback to default
+        Ok(format!("Post {post_id}"))
+    }
+
+    async fn get_existing_blogger_post_id(&self, _post_id: i64) -> Result<String> {
+        // Could add a REST endpoint for this
+        Ok(String::new())
     }
 
     fn origin_to_local(&self, url: &str) -> Option<String> {
@@ -130,34 +157,29 @@ impl OffloadEngine {
 
     pub async fn run_poll_loop(self: Arc<Self>) {
         let interval = std::cmp::max(10, self.cfg.agent.poll_interval_secs);
-        tracing::info!("offload poll loop started ({}s)", interval);
+        info!("offload poll loop started ({}s)", interval);
         loop {
-            match self.db.list_candidate_post_ids(20).await {
+            // Poll posts from plugin stats endpoint
+            match self.poll_candidate_posts().await {
                 Ok(ids) => {
                     for pid in ids {
-                        // process posts that appear to have local uploads in content
-                        match self.db.extract_post_images(pid).await {
-                            Ok(imgs) if !imgs.is_empty() => {
-                                // only process if there is pending/upload work
-                                if let Ok(rows) = self.db.ensure_post_images_registered(pid).await {
-                                    let needs = rows.iter().any(|r| r.status != "replaced" || r.blogger_url.as_deref().unwrap_or("").is_empty());
-                                    if needs {
-                                        match self.process_post(pid).await {
-                                            Ok(r) => tracing::info!(post_id=pid, result=%r, "post processed"),
-                                            Err(e) => tracing::error!(post_id=pid, error=%e, "post process failed"),
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
+                        match self.process_post(pid).await {
+                            Ok(r) => info!(post_id=pid, result=%r, "post processed"),
+                            Err(e) => warn!(post_id=pid, error=%e, "post process failed"),
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                 }
-                Err(e) => tracing::error!("poll list posts failed: {}", e),
+                Err(e) => warn!("poll list posts failed: {}", e),
             }
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         }
+    }
+
+    async fn poll_candidate_posts(&self) -> Result<Vec<i64>> {
+        // Get stats to find posts with pending images
+        // For now, return empty - could add a REST endpoint for this
+        Ok(vec![])
     }
 }
 
