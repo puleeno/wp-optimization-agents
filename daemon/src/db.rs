@@ -21,8 +21,18 @@ pub struct ImageMapRow {
     pub blogger_url: Option<String>,
     pub blogger_image_id: Option<String>,
     pub transformed_params: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub mime_type: Option<String>,
+    pub original_size_bytes: Option<i64>,
+    pub offload_size_bytes: Option<i64>,
     pub status: String,
     pub redirect_active: i32,
+    pub error_message: Option<String>,
+    pub metadata: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub replaced_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +303,110 @@ impl Db {
         ).await?;
         Ok(row.map(|r| r.0).unwrap_or_else(|| format!("Post {post_id}")))
     }
+
+    pub async fn get_stats(&self) -> Result<serde_json::Value> {
+        let mut conn = self.pool.get_conn().await?;
+        let total: Option<(u64,)> = conn.exec_first(
+            format!("SELECT COUNT(*) FROM {}", self.images_table()),
+            ()
+        ).await?;
+        let pending: Option<(u64,)> = conn.exec_first(
+            format!("SELECT COUNT(*) FROM {} WHERE status='pending'", self.images_table()),
+            ()
+        ).await?;
+        let uploading: Option<(u64,)> = conn.exec_first(
+            format!("SELECT COUNT(*) FROM {} WHERE status='uploading'", self.images_table()),
+            ()
+        ).await?;
+        let uploaded: Option<(u64,)> = conn.exec_first(
+            format!("SELECT COUNT(*) FROM {} WHERE status='uploaded'", self.images_table()),
+            ()
+        ).await?;
+        let replacing: Option<(u64,)> = conn.exec_first(
+            format!("SELECT COUNT(*) FROM {} WHERE status='replacing'", self.images_table()),
+            ()
+        ).await?;
+        let replaced: Option<(u64,)> = conn.exec_first(
+            format!("SELECT COUNT(*) FROM {} WHERE status='replaced'", self.images_table()),
+            ()
+        ).await?;
+        let failed: Option<(u64,)> = conn.exec_first(
+            format!("SELECT COUNT(*) FROM {} WHERE status='failed'", self.images_table()),
+            ()
+        ).await?;
+
+        Ok(serde_json::json!({
+            "total": total.map(|r| r.0).unwrap_or(0),
+            "pending": pending.map(|r| r.0).unwrap_or(0),
+            "uploading": uploading.map(|r| r.0).unwrap_or(0),
+            "uploaded": uploaded.map(|r| r.0).unwrap_or(0),
+            "replacing": replacing.map(|r| r.0).unwrap_or(0),
+            "replaced": replaced.map(|r| r.0).unwrap_or(0),
+            "failed": failed.map(|r| r.0).unwrap_or(0),
+        }))
+    }
+
+    pub async fn list_images(&self, limit: usize, offset: usize, status_filter: Option<String>) -> Result<Vec<ImageMapRow>> {
+        let mut conn = self.pool.get_conn().await?;
+        let status_cond = status_filter.map(|s| format!("WHERE status = '{}'", s)).unwrap_or_default();
+        let rows: Vec<Row> = conn.exec(
+            format!("SELECT * FROM {} {} ORDER BY id DESC LIMIT :lim OFFSET :off", self.images_table(), status_cond),
+            params!{"lim"=> limit as u64, "off"=> offset as u64}
+        ).await?;
+        Ok(rows.into_iter().map(row_to_image).collect())
+    }
+
+    pub async fn list_posts_with_stats(&self, limit: usize, offset: usize) -> Result<Vec<PostStatsRow>> {
+        let mut conn = self.pool.get_conn().await?;
+        let rows: Vec<Row> = conn.exec(
+            format!(
+                "SELECT p.ID, p.post_title, p.post_status,
+                        COUNT(i.id) as total_images,
+                        SUM(CASE WHEN i.status IN ('uploaded','replaced') THEN 1 ELSE 0 END) as offloaded_images,
+                        SUM(CASE WHEN i.status = 'replaced' THEN 1 ELSE 0 END) as replaced_images,
+                        MAX(CASE WHEN pm.meta_key='_wpoa_blogger_post_id' THEN pm.meta_value END) as blogger_post_id,
+                        MAX(CASE WHEN pm.meta_key='_wpoa_blogger_post_url' THEN pm.meta_value END) as blogger_post_url,
+                        MAX(CASE WHEN pm.meta_key='_wpoa_blogger_blog_id' THEN pm.meta_value END) as blogger_blog_id,
+                        MAX(CASE WHEN pm.meta_key='_wpoa_blogger_linked_at' THEN pm.meta_value END) as linked_at
+                 FROM {} p
+                 LEFT JOIN {} i ON i.post_id = p.ID
+                 LEFT JOIN {} pm ON pm.post_id = p.ID AND pm.meta_key LIKE '_wpoa_blogger_%'
+                 WHERE p.post_type='post' AND p.post_status IN ('publish','draft','future','private')
+                 GROUP BY p.ID
+                 ORDER BY p.ID DESC
+                 LIMIT :lim OFFSET :off",
+                self.posts_table(), self.images_table(), self.postmeta_table()
+            ),
+            params!{"lim"=> limit as u64, "off"=> offset as u64}
+        ).await?;
+
+        Ok(rows.into_iter().map(|r| PostStatsRow {
+            id: r.get::<i64,_>("ID").unwrap_or(0),
+            title: r.get::<String,_>("post_title").unwrap_or_default(),
+            status: r.get::<String,_>("post_status").unwrap_or_else(|| "publish".into()),
+            total_images: r.get::<u64,_>("total_images").unwrap_or(0) as i64,
+            offloaded_images: r.get::<u64,_>("offloaded_images").unwrap_or(0) as i64,
+            replaced_images: r.get::<u64,_>("replaced_images").unwrap_or(0) as i64,
+            blogger_post_id: r.get::<Option<String>,_>("blogger_post_id").unwrap_or(None),
+            blogger_post_url: r.get::<Option<String>,_>("blogger_post_url").unwrap_or(None),
+            blogger_blog_id: r.get::<Option<String>,_>("blogger_blog_id").unwrap_or(None),
+            linked_at: r.get::<Option<String>,_>("linked_at").unwrap_or(None),
+        }).collect())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PostStatsRow {
+    pub id: i64,
+    pub title: String,
+    pub status: String,
+    pub total_images: i64,
+    pub offloaded_images: i64,
+    pub replaced_images: i64,
+    pub blogger_post_id: Option<String>,
+    pub blogger_post_url: Option<String>,
+    pub blogger_blog_id: Option<String>,
+    pub linked_at: Option<String>,
 }
 
 fn row_to_image(r: Row) -> ImageMapRow {
@@ -305,8 +419,18 @@ fn row_to_image(r: Row) -> ImageMapRow {
         blogger_url: r.get("blogger_url"),
         blogger_image_id: r.get("blogger_image_id"),
         transformed_params: r.get("transformed_params"),
+        width: r.get("width"),
+        height: r.get("height"),
+        mime_type: r.get("mime_type"),
+        original_size_bytes: r.get("original_size_bytes"),
+        offload_size_bytes: r.get("offload_size_bytes"),
         status: r.get::<String,_>("status").unwrap_or_else(|| "pending".into()),
         redirect_active: r.get::<i32,_>("redirect_active").unwrap_or(0),
+        error_message: r.get("error_message"),
+        metadata: r.get("metadata"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+        replaced_at: r.get("replaced_at"),
     }
 }
 
