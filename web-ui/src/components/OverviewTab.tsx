@@ -12,12 +12,25 @@ import {
 } from 'lucide-react';
 import { DaemonMetrics, DailyAuditRecord } from '../types/dashboard';
 
+interface CurrentTask {
+  active?: boolean;
+  kind?: string;
+  stage?: string;
+  postId?: number;
+  message?: string;
+  progressCurrent?: number;
+  progressTotal?: number;
+  startedAt?: string;
+  updatedAt?: string;
+}
+
 interface OverviewTabProps {
   metrics: DaemonMetrics | null;
   latestAudit: DailyAuditRecord | null;
   onNavigateTab: (tab: string) => void;
   onTriggerAudit: () => void;
   isAuditing: boolean;
+  currentTask?: CurrentTask | null;
 }
 
 export function OverviewTab({
@@ -26,6 +39,7 @@ export function OverviewTab({
   onNavigateTab,
   onTriggerAudit,
   isAuditing,
+  currentTask,
 }: OverviewTabProps) {
   const formatBytes = (bytes: number): string => {
     if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
@@ -43,8 +57,40 @@ export function OverviewTab({
     );
   }
 
+  const isWorking = !!currentTask && (currentTask.active || (currentTask.kind && currentTask.kind !== 'idle'));
+  const progressPct = currentTask && currentTask.progressTotal ? Math.min(100, Math.round(((currentTask.progressCurrent || 0) / currentTask.progressTotal) * 100)) : null;
+
   return (
     <div className="space-y-6 animate-fadeIn">
+      <div className={`p-4 rounded-xl border ${isWorking ? 'bg-orange-50/70 dark:bg-orange-950/20 border-orange-200 dark:border-orange-800' : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800'}`}>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-xs font-mono font-medium">
+              <span className={`inline-flex w-2 h-2 rounded-full ${isWorking ? 'bg-orange-500 animate-pulse' : 'bg-slate-400'}`} />
+              <span className={isWorking ? 'text-orange-700 dark:text-orange-300' : 'text-slate-500 dark:text-slate-400'}>CÔNG VIỆC HIỆN TẠI (REALTIME)</span>
+              {currentTask?.stage && <span className="text-slate-400">·</span>}
+              {currentTask?.stage && <span className="text-slate-600 dark:text-slate-300">{currentTask.stage}</span>}
+            </div>
+            <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-white truncate">
+              {currentTask?.message || 'Không có tác vụ đang chạy'}
+            </div>
+            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400 font-mono flex flex-wrap gap-x-3 gap-y-1">
+              {currentTask?.postId != null && <span>Post: #{currentTask.postId}</span>}
+              {progressPct != null && currentTask?.progressTotal ? <span>Tiến độ: {currentTask.progressCurrent || 0}/{currentTask.progressTotal} ({progressPct}%)</span> : null}
+              {currentTask?.updatedAt && <span>Cập nhật: {new Date(currentTask.updatedAt).toLocaleTimeString()}</span>}
+            </div>
+          </div>
+          <div className="shrink-0 text-xs px-2 py-1 rounded font-mono font-semibold ${isWorking ? 'bg-orange-100 dark:bg-orange-900/50 text-orange-700 dark:text-orange-300' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300'}">
+            {isWorking ? 'Đang xử lý' : 'Chờ tác vụ'}
+          </div>
+        </div>
+        {progressPct != null && (
+          <div className="mt-3 h-1.5 w-full bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+            <div className={`h-full rounded-full ${isWorking ? 'bg-orange-500' : 'bg-slate-400'}`} style={{ width: `${progressPct}%` }} />
+          </div>
+        )}
+      </div>
+
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="p-4 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
           <div className="flex items-center justify-between text-slate-500 dark:text-slate-400 text-xs mb-2">

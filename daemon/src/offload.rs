@@ -6,25 +6,62 @@ use crate::error::Result;
 use crate::wp_api::{WpApiClient, WpImage, WpPostStatusResponse};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct CurrentTask {
+    pub active: bool,
+    pub kind: String,
+    pub stage: String,
+    pub post_id: Option<i64>,
+    pub message: String,
+    pub progress_current: usize,
+    pub progress_total: usize,
+    pub started_at: Option<String>,
+    pub updated_at: Option<String>,
+}
 
 pub struct OffloadEngine {
     cfg: Arc<Config>,
     wp_api: WpApiClient,
     db: Db,
+    current_task: Arc<RwLock<Option<CurrentTask>>>,
 }
 
 impl OffloadEngine {
-    pub async fn new(cfg: Arc<Config>) -> Result<Self> {
+    pub async fn new(cfg: Arc<Config>, current_task: Arc<RwLock<Option<CurrentTask>>>) -> Result<Self> {
         let base_url = format!("{}/wp-json/wp-opt-agents/v1", cfg.site.url.trim_end_matches('/'));
         let token = cfg.agent.daemon_api_token.clone();
         let wp_api = WpApiClient::new(base_url, token);
         let db = Db::new((*cfg).clone())?;
         db.ping().await?;
-        Ok(Self { cfg, wp_api, db })
+        Ok(Self { cfg, wp_api, db, current_task })
     }
 
     pub fn db(&self) -> &Db { &self.db }
+
+    async fn set_task(&self, task: Option<CurrentTask>) {
+        let mut guard = self.current_task.write().await;
+        *guard = task;
+    }
+
+    async fn update_stage(&self, stage: &str, message: String, progress_current: usize, progress_total: usize, post_id: Option<i64>) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut guard = self.current_task.write().await;
+        let started = guard.as_ref().and_then(|t| t.started_at.clone()).or_else(|| Some(now.clone()));
+        *guard = Some(CurrentTask {
+            active: true,
+            kind: "offload_post".to_string(),
+            stage: stage.to_string(),
+            post_id,
+            message,
+            progress_current,
+            progress_total,
+            started_at: started,
+            updated_at: Some(now),
+        });
+    }
 
     /// Process one WP post using plugin REST API:
     /// 1. Get post status (images) from plugin
@@ -35,10 +72,15 @@ impl OffloadEngine {
     /// 6. Mark images replaced in plugin (triggers 301 redirects + URL replacement)
     pub async fn process_post(&self, post_id: i64) -> Result<serde_json::Value> {
         info!(post_id, "processing post via WP REST API");
+        self.update_stage("fetching", format!("Đang lấy trạng thái ảnh của bài viết #{}", post_id), 0, 1, Some(post_id)).await;
 
         // 1. Get post status from plugin
-        let post_status = self.wp_api.get_post_status(post_id).await?;
+        let post_status = match self.wp_api.get_post_status(post_id).await {
+            Ok(v) => v,
+            Err(e) => { self.set_task(None).await; return Err(e); }
+        };
         if post_status.images.is_empty() {
+            self.set_task(None).await;
             return Ok(serde_json::json!({"post_id": post_id, "status":"no_images", "uploaded":0, "replaced":0}));
         }
 
@@ -48,6 +90,7 @@ impl OffloadEngine {
             .collect();
 
         if to_upload.is_empty() {
+            self.set_task(None).await;
             return Ok(serde_json::json!({"post_id": post_id, "status":"all_uploaded", "uploaded":0, "replaced":0}));
         }
 
@@ -59,13 +102,21 @@ impl OffloadEngine {
 
         if paths.is_empty() {
             warn!(post_id, "no local files found for images");
+            self.set_task(None).await;
             return Ok(serde_json::json!({"post_id": post_id, "status":"no_local_files", "uploaded":0, "replaced":0}));
         }
 
+        self.update_stage("launching_chrome", format!("Đang khởi động Chrome để upload {} ảnh (post #{})", paths.len(), post_id), 0, paths.len(), Some(post_id)).await;
+
         // 3. Upload to Blogger
-        let cdp = self.launch_chrome().await?;
+        let cdp = match self.launch_chrome().await {
+            Ok(v) => v,
+            Err(e) => { self.set_task(None).await; return Err(e); }
+        };
         let title = self.get_post_title_via_api(post_id).await.unwrap_or_else(|_| format!("Post {post_id}"));
-        let existing_post_id = self.get_existing_blogger_post_id(post_id).await?;
+        let existing_post_id = self.get_existing_blogger_post_id(post_id).await.unwrap_or_default();
+
+        self.update_stage("uploading", format!("Đang upload ảnh lên Blogger (post #{}, {} ảnh)", post_id, paths.len()), 0, paths.len(), Some(post_id)).await;
 
         let existing = if existing_post_id.is_empty() { None } else { Some(existing_post_id.as_str()) };
         let res = blogger::upload_images_for_post(&cdp, &self.cfg.blogger.blog_id, &title, existing, &paths).await;
@@ -78,12 +129,14 @@ impl OffloadEngine {
                     let _ = self.wp_api.mark_image_failed(im.id, &e.to_string()).await;
                 }
                 cdp.close().await;
+                self.set_task(None).await;
                 return Err(e);
             }
         };
         cdp.close().await;
 
         // 4. Mark images uploaded in plugin with blogger URLs
+        self.update_stage("saving_upload", format!("Đang lưu URL Blogger vào plugin (post #{})", post_id), paths.len(), paths.len(), Some(post_id)).await;
         for (i, up) in uploaded_images.iter().enumerate() {
             if i < to_upload.len() {
                 let im = &to_upload[i];
@@ -97,6 +150,7 @@ impl OffloadEngine {
         }
 
         // 5. Link blogger post in plugin
+        self.update_stage("linking", format!("Đang liên kết WP post #{} ↔ Blogger post", post_id), paths.len(), paths.len(), Some(post_id)).await;
         let blogger_album_url = format!("https://www.blogger.com/blog/post/{}", blogger_post_id);
         let _ = self.wp_api.link_blogger_post(
             post_id,
@@ -107,15 +161,18 @@ impl OffloadEngine {
         ).await;
 
         // 6. Mark images replaced in plugin (triggers 301 redirects + URL replacement in WP)
+        self.update_stage("replacing", format!("Đang thay URL trong WP DB và bật redirect (post #{})", post_id), 0, to_upload.len(), Some(post_id)).await;
         let mut replaced_count = 0;
-        for im in &to_upload {
+        for (idx, im) in to_upload.iter().enumerate() {
             if let Err(e) = self.wp_api.mark_image_replaced(im.id).await {
                 warn!(image_id = im.id, error = %e, "failed to mark replaced in plugin");
             } else {
                 replaced_count += 1;
             }
+            self.update_stage("replacing", format!("Đã xử lý {}/{} ảnh (post #{})", idx + 1, to_upload.len(), post_id), idx + 1, to_upload.len(), Some(post_id)).await;
         }
 
+        self.set_task(None).await;
         Ok(serde_json::json!({
             "post_id": post_id,
             "blogger": {
@@ -159,7 +216,17 @@ impl OffloadEngine {
         let interval = std::cmp::max(10, self.cfg.agent.poll_interval_secs);
         info!("offload poll loop started ({}s)", interval);
         loop {
-            // Poll posts from plugin stats endpoint
+            self.set_task(Some(CurrentTask {
+                active: false,
+                kind: "idle".to_string(),
+                stage: "waiting".to_string(),
+                post_id: None,
+                message: "Đang chờ tác vụ offload tiếp theo...".to_string(),
+                progress_current: 0,
+                progress_total: 0,
+                started_at: None,
+                updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            })).await;
             match self.poll_candidate_posts().await {
                 Ok(ids) => {
                     for pid in ids {

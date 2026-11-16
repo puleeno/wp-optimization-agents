@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { OverviewTab } from './components/OverviewTab';
@@ -16,6 +17,24 @@ import {
   AgentConfig,
 } from './types/dashboard';
 
+const TAB_ROUTES: Record<string, string> = {
+  overview: '/',
+  blogger_lab: '/blogger',
+  daemon_engine: '/daemon',
+  wp_scanner: '/scanner',
+  daily_audit: '/audit',
+  config: '/config',
+};
+
+const PATH_TO_TAB: Record<string, string> = {
+  '/': 'overview',
+  '/blogger': 'blogger_lab',
+  '/daemon': 'daemon_engine',
+  '/scanner': 'wp_scanner',
+  '/audit': 'daily_audit',
+  '/config': 'config',
+};
+
 const API_BASE = '/api';
 
 async function fetchJson<T>(url: string): Promise<T | null> {
@@ -29,9 +48,12 @@ async function fetchJson<T>(url: string): Promise<T | null> {
 }
 
 export default function App() {
+  const navigate = useNavigate();
+  const location = useLocation();
   const [darkMode, setDarkMode] = useState<boolean>(true);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<string>('overview');
+  const activeTab = PATH_TO_TAB[location.pathname] || 'overview';
+  const setActiveTab = (tab: string) => navigate(TAB_ROUTES[tab] || '/');
 
   const [daemonMetrics, setDaemonMetrics] = useState<DaemonMetrics | null>(null);
   const [images, setImages] = useState<OffloadImage[]>([]);
@@ -39,6 +61,7 @@ export default function App() {
   const [posts, setPosts] = useState<WordPressPost[]>([]);
   const [logs, setLogs] = useState<AgentLog[]>([]);
   const [config, setConfig] = useState<AgentConfig | null>(null);
+  const [currentTask, setCurrentTask] = useState<any>(null);
 
   const [isAuditing, setIsAuditing] = useState<boolean>(false);
   const [activeAuditStep, setActiveAuditStep] = useState<number>(0);
@@ -54,16 +77,23 @@ export default function App() {
     }
   }, [darkMode]);
 
+  const loadCurrentTask = useCallback(async () => {
+    const data = await fetchJson<any>(`${API_BASE}/tasks/current`);
+    if (data) setCurrentTask(data.task ?? null);
+  }, []);
+
   const loadAllData = useCallback(async () => {
     setLoading(true);
     try {
-      const [metrics, imgs, audits, postsData, configData] = await Promise.all([
+      const [metrics, imgs, audits, postsData, configData, taskData] = await Promise.all([
         fetchJson<DaemonMetrics>(`${API_BASE}/metrics`),
         fetchJson<any[]>(`${API_BASE}/images?limit=100`),
         fetchJson<DailyAuditRecord[]>(`${API_BASE}/audits`),
         fetchJson<WordPressPost[]>(`${API_BASE}/posts?limit=50`),
         fetchJson<AgentConfig>(`${API_BASE}/config`),
+        fetchJson<any>(`${API_BASE}/tasks/current`),
       ]);
+      if (taskData) setCurrentTask(taskData.task ?? null);
       if (metrics) setDaemonMetrics(metrics);
       if (imgs) {
         const mapped: OffloadImage[] = imgs.map((im: any) => ({
@@ -145,8 +175,9 @@ export default function App() {
   useEffect(() => {
     loadAllData();
     const interval = setInterval(loadAllData, 10000);
-    return () => clearInterval(interval);
-  }, [loadAllData]);
+    const taskInterval = setInterval(loadCurrentTask, 3000);
+    return () => { clearInterval(interval); clearInterval(taskInterval); };
+  }, [loadAllData, loadCurrentTask]);
 
   const handleAddOffloadedImage = async (newImage: OffloadImage) => {
     setImages((prev) => [newImage, ...prev]);
@@ -273,55 +304,72 @@ export default function App() {
         />
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
-          {activeTab === 'overview' && (
-            <OverviewTab
-              metrics={daemonMetrics}
-              latestAudit={dailyAudits[0] || null}
-              onNavigateTab={setActiveTab}
-              onTriggerAudit={handleTriggerAudit}
-              isAuditing={isAuditing}
+          <Routes>
+            <Route
+              path="/"
+              element={
+                <OverviewTab
+                  metrics={daemonMetrics}
+                  latestAudit={dailyAudits[0] || null}
+                  onNavigateTab={setActiveTab}
+                  onTriggerAudit={handleTriggerAudit}
+                  isAuditing={isAuditing}
+                  currentTask={currentTask}
+                />
+              }
             />
-          )}
-
-          {activeTab === 'blogger_lab' && (
-            <BloggerLabTab
-              images={images}
-              onAddOffloadedImage={handleAddOffloadedImage}
+            <Route
+              path="/blogger"
+              element={
+                <BloggerLabTab
+                  images={images}
+                  onAddOffloadedImage={handleAddOffloadedImage}
+                />
+              }
             />
-          )}
-
-          {activeTab === 'daemon_engine' && (
-            <DaemonEngineTab
-              metrics={daemonMetrics}
-              setMetrics={setDaemonMetrics}
-              logs={logs}
-              setLogs={setLogs}
+            <Route
+              path="/daemon"
+              element={
+                <DaemonEngineTab
+                  metrics={daemonMetrics}
+                  setMetrics={setDaemonMetrics}
+                  logs={logs}
+                  setLogs={setLogs}
+                />
+              }
             />
-          )}
-
-          {activeTab === 'wp_scanner' && (
-            <WordPressScannerTab
-              posts={posts}
-              onProcessPost={handleProcessPost}
-              onBatchOffloadAll={handleBatchOffloadAll}
+            <Route
+              path="/scanner"
+              element={
+                <WordPressScannerTab
+                  posts={posts}
+                  onProcessPost={handleProcessPost}
+                  onBatchOffloadAll={handleBatchOffloadAll}
+                />
+              }
             />
-          )}
-
-          {activeTab === 'daily_audit' && (
-            <DailyAuditTab
-              audits={dailyAudits}
-              onTriggerAudit={handleTriggerAudit}
-              isAuditing={isAuditing}
-              activeAuditStep={activeAuditStep}
+            <Route
+              path="/audit"
+              element={
+                <DailyAuditTab
+                  audits={dailyAudits}
+                  onTriggerAudit={handleTriggerAudit}
+                  isAuditing={isAuditing}
+                  activeAuditStep={activeAuditStep}
+                />
+              }
             />
-          )}
-
-          {activeTab === 'config' && (
-            <ConfigTab
-              config={config}
-              onSaveConfig={handleSaveConfig}
+            <Route
+              path="/config"
+              element={
+                <ConfigTab
+                  config={config}
+                  onSaveConfig={handleSaveConfig}
+                />
+              }
             />
-          )}
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
         </main>
 
         <footer className="border-t border-slate-200 dark:border-slate-800 py-4 mt-auto bg-white/50 dark:bg-slate-950/50 text-xs text-slate-500 dark:text-slate-400">

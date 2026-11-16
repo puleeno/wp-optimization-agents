@@ -13,7 +13,8 @@
     "@tailwindcss/vite": "^4.3.3",
     "lucide-react": "^0.546.0",
     "react": "^19.0.1",
-    "react-dom": "^19.0.1"
+    "react-dom": "^19.0.1",
+    "react-router-dom": "^7.18.5"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

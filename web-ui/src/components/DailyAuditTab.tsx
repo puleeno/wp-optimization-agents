@@ -143,6 +143,7 @@ export const DailyAuditTab: React.FC<DailyAuditTabProps> = ({
       )}
 
       {/* Selected Audit Deep-Dive Spotlight Card */}
+      {selectedAudit ? (
       <div className="p-5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-3">
           <div>
@@ -151,7 +152,7 @@ export const DailyAuditTab: React.FC<DailyAuditTabProps> = ({
                 CHI TIẾT ĐỢT KIỂM TRA
               </span>
               <span>·</span>
-              <span className="text-xs font-mono text-slate-500">{selectedAudit.timestamp}</span>
+              <span className="text-xs font-mono text-slate-500">{selectedAudit.timestamp || selectedAudit.dateStr || ''}</span>
             </div>
             <h3 className="text-sm font-bold text-slate-900 dark:text-white mt-0.5 truncate max-w-xl">
               {selectedAudit.targetSiteUrl}
@@ -166,7 +167,7 @@ export const DailyAuditTab: React.FC<DailyAuditTabProps> = ({
                   : 'bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-400'
               }`}
             >
-              Lighthouse: {selectedAudit.lighthouseScore}/100 ({selectedAudit.status.toUpperCase()})
+              Lighthouse: {selectedAudit.lighthouseScore}/100 ({(selectedAudit.status || '').toUpperCase()})
             </span>
           </div>
         </div>
@@ -212,7 +213,7 @@ export const DailyAuditTab: React.FC<DailyAuditTabProps> = ({
             Độ trễ truyền tải ảnh Blogger CDN theo khu vực địa lý:
           </span>
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2 font-mono text-xs">
-            {selectedAudit.locations.map((loc, idx) => (
+            {(selectedAudit.locations || []).map((loc, idx) => (
               <div
                 key={idx}
                 className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/30 flex justify-between items-center"
@@ -237,6 +238,11 @@ export const DailyAuditTab: React.FC<DailyAuditTabProps> = ({
           {selectedAudit.notes}
         </div>
       </div>
+      ) : (
+        <div className="p-5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm text-slate-500 dark:text-slate-400">
+          Chưa có bản ghi audit. Chạy kiểm tra tự động để tạo báo cáo.
+        </div>
+      )}
 
       {/* Daily Audit History Table */}
       <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">

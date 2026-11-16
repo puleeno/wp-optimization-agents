@@ -2,12 +2,13 @@ use crate::chrome::default_chrome_path;
 use crate::config::Config;
 use crate::db::{Db, ImageMapRow, PostStatsRow};
 use crate::error::{Error, Result};
-use crate::offload::OffloadEngine;
+use crate::offload::{CurrentTask, OffloadEngine};
 use axum::{extract::{Path, Query, State}, response::IntoResponse, routing::{get, post}, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use chrono::{DateTime, Utc};
@@ -17,6 +18,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub engine: Option<Arc<OffloadEngine>>,
     pub db_ok: bool,
+    pub current_task: Arc<RwLock<Option<CurrentTask>>>,
 }
 
 #[derive(Serialize)]
@@ -124,6 +126,7 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/logs", get(list_logs))
         .route("/api/audits", get(list_audits))
         .route("/api/config", get(get_config))
+        .route("/api/tasks/current", get(get_current_task))
         .route("/api/posts/:id/process", post(process_post))
         .with_state(state.clone());
 
@@ -144,6 +147,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 
     // Get basic stats from DB
     let stats = db.get_stats().await.unwrap_or_default();
+    let active_tasks = if state.current_task.read().await.as_ref().map(|t| t.active).unwrap_or(false) { 1 } else { 0 };
 
     Json(MetricsResponse {
         status: "ok",
@@ -154,7 +158,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         cpu_percent: 0.0,
         total_images_offloaded: stats.get("replaced").and_then(|v| v.as_u64()).unwrap_or(0),
         total_bytes_saved: 0, // Would need to calculate
-        active_tasks: 0,
+        active_tasks,
     })
 }
 
@@ -310,6 +314,11 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+async fn get_current_task(State(state): State<AppState>) -> impl IntoResponse {
+    let task = state.current_task.read().await.clone();
+    Json(serde_json::json!({"ok": true, "task": task}))
+}
+
 async fn process_post(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let Some(engine) = state.engine.as_ref() else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"engine/db not ready"})));
@@ -324,8 +333,9 @@ pub async fn run_server(config: Config, host_override: Option<String>, port_over
     let host = host_override.unwrap_or_else(|| config.agent.host.clone());
     let port = port_override.unwrap_or(config.agent.port);
     let cfg = Arc::new(config);
+    let current_task: Arc<RwLock<Option<CurrentTask>>> = Arc::new(RwLock::new(None));
 
-    let (engine, db_ok) = match OffloadEngine::new(cfg.clone()).await {
+    let (engine, db_ok) = match OffloadEngine::new(cfg.clone(), current_task.clone()).await {
         Ok(e) => {
             let e = Arc::new(e);
             let bg = e.clone();
@@ -342,7 +352,7 @@ pub async fn run_server(config: Config, host_override: Option<String>, port_over
         tracing::warn!("web-ui dist not found: {} (build agents/web-ui)", dist_dir.display());
     }
 
-    let state = AppState { config: cfg, engine, db_ok };
+    let state = AppState { config: cfg, engine, db_ok, current_task };
     let app = create_router(state, dist_dir);
     let addr: SocketAddr = format!("{host}:{port}").parse().map_err(|e| Error::ConfigError(format!("invalid bind addr: {e}")))?;
     tracing::info!("wp-offload-daemon listening on http://{addr} (web-ui + API), chrome={}", default_chrome_path().display());
