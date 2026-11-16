@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use reqwest::multipart;
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -36,7 +37,7 @@ impl ImgbbClient {
         }
     }
 
-    /// Upload to imgbb using a direct/public WordPress image URL (preferred).
+    /// Upload to imgbb using a direct/public WordPress image URL.
     pub async fn upload_url(&self, image_url: &str, name: Option<&str>) -> Result<String> {
         let mut form = vec![("image".to_string(), image_url.to_string())];
         if let Some(n) = name {
@@ -52,6 +53,32 @@ impl ImgbbClient {
             .send()
             .await
             .map_err(|e| Error::NetworkError(format!("imgbb upload url: {}", e)))?;
+        self.parse_response(resp).await
+    }
+
+    /// Upload to imgbb using local binary/blob file bytes (multipart/form-data).
+    pub async fn upload_blob(&self, path: &str, name: Option<&str>) -> Result<String> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| Error::NetworkError(format!("read file {}: {}", path, e)))?;
+        let file_name = name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or("image"));
+        let part = multipart::Part::bytes(bytes).file_name(file_name.to_string());
+        let mut form = multipart::Form::new().part("image", part);
+        if let Some(n) = name {
+            if !n.trim().is_empty() {
+                form = form.text("name", n.to_string());
+            }
+        }
+        let resp = self
+            .client
+            .post("https://api.imgbb.com/1/upload")
+            .query(&[("key", self.api_key.as_str())])
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| Error::NetworkError(format!("imgbb upload blob: {}", e)))?;
         self.parse_response(resp).await
     }
 

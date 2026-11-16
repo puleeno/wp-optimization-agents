@@ -354,6 +354,7 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         "imgbb": {
             "enabled": cfg.imgbb.enabled,
             "api_key_set": !cfg.imgbb.api_key.trim().is_empty(),
+            "upload_format": cfg.imgbb.upload_format,
         },
         "cdn": {
             "host": cfg.cdn.host,

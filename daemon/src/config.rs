@@ -85,12 +85,25 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ImgbbConfig {
     #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// "url" = upload via direct/public WP image URL, "blob" = upload binary/file bytes from local path
+    #[serde(default = "default_imgbb_upload_format")]
+    pub upload_format: String,
+}
+
+impl Default for ImgbbConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            enabled: true,
+            upload_format: default_imgbb_upload_format(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -118,6 +131,7 @@ fn default_true() -> bool { true }
 fn default_log_level() -> String { "info".into() }
 fn default_cdn_scheme() -> String { "https".into() }
 fn default_cdn_host() -> String { "cdn.nghesachxua.localhost".into() }
+fn default_imgbb_upload_format() -> String { "url".into() }
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
@@ -158,7 +172,7 @@ impl Config {
             blogger: BloggerConfig { blog_id: String::new(), upload_via: default_upload_via(), one_wp_post_per_blogger_post: true },
             chrome: ChromeConfig { executable: None, user_data_dir: None, profile_directory: default_profile_dir(), headless: false, remote_debugging_port: default_debug_port(), launch_timeout_secs: default_launch_timeout() },
             agent: AgentConfig { host: default_host(), port: default_agent_port(), poll_interval_secs: default_poll(), replace_in_db: true, enable_old_url_redirect_301: true, backup_before_replace: true, daemon_api_token: String::new() },
-            imgbb: ImgbbConfig { api_key: String::new(), enabled: true },
+            imgbb: ImgbbConfig::default(),
             cdn: CdnConfig::default(),
             logging: LoggingConfig { level: default_log_level() },
         };

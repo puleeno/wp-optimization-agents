@@ -82,12 +82,19 @@ impl WebhookProcessor {
                 continue;
             }
 
-            // upload to imgbb using direct WordPress URL as requested
             let imgbb_name = std::path::Path::new(&local_path)
                 .file_name()
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_string());
-            let imgbb_url = imgbb.upload_url(&sz.url, imgbb_name.as_deref()).await?;
+            let imgbb_url = match self.cfg.imgbb.upload_format.as_str() {
+                "blob" | "binary" | "file" => {
+                    imgbb.upload_blob(&local_path, imgbb_name.as_deref()).await?
+                }
+                _ => {
+                    // default "url": upload using direct WordPress image URL (imgbb fetches it)
+                    imgbb.upload_url(&sz.url, imgbb_name.as_deref()).await?
+                }
+            };
 
             let cdn_url = self
                 .db

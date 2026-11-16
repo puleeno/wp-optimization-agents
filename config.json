@@ -35,7 +35,8 @@
   },
   "imgbb": {
     "api_key": "",
-    "enabled": true
+    "enabled": true,
+    "upload_format": "url"
   },
   "cdn": {
     "host": "cdn.nghesachxua.localhost",
