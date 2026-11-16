@@ -92,6 +92,7 @@ struct PostResponse {
     id: i64,
     title: Option<String>,
     status: Option<String>,
+    post_type: Option<String>,
     total_images: i64,
     offloaded_images: i64,
     replaced_images: i64,
@@ -127,11 +128,13 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/stats", get(stats))
         .route("/api/images", get(list_images))
         .route("/api/posts", get(list_posts))
+        .route("/api/attachments", get(list_attachments))
         .route("/api/logs", get(list_logs))
         .route("/api/audits", get(list_audits))
         .route("/api/config", get(get_config))
         .route("/api/tasks/current", get(get_current_task))
         .route("/api/posts/:id/process", post(process_post))
+        .route("/api/attachments/:id/process", post(process_attachment))
         .route("/api/webhooks/media-upload", post(media_upload_webhook))
         .route("/webhook/media-upload", post(media_upload_webhook))
         .route("/cdn/*path", get(cdn_proxy))
@@ -229,8 +232,7 @@ Err(e) => {
 }
 
 async fn list_posts(State(state): State<AppState>, Query(q): Query<ListQuery>) -> impl IntoResponse {
-    let engine = state.engine.as_ref();
-    let db = if let Some(e) = engine { e.db() } else { return Json(vec![]); };
+    let db = if let Some(db) = state.db.as_ref() { db } else if let Some(e) = state.engine.as_ref() { e.db() } else { return Json(vec![]); };
 
     let limit = q.limit.unwrap_or(50) as usize;
     let offset = q.offset.unwrap_or(0) as usize;
@@ -240,6 +242,7 @@ async fn list_posts(State(state): State<AppState>, Query(q): Query<ListQuery>) -
             id: p.id,
             title: Some(p.title),
             status: Some(p.status),
+            post_type: Some(p.post_type),
             total_images: p.total_images,
             offloaded_images: p.offloaded_images,
             replaced_images: p.replaced_images,
@@ -252,6 +255,35 @@ async fn list_posts(State(state): State<AppState>, Query(q): Query<ListQuery>) -
             tracing::error!("list_posts failed: {}", e);
             Json(Vec::<PostResponse>::new())
         }
+    }
+}
+
+async fn list_attachments(State(state): State<AppState>, Query(q): Query<ListQuery>) -> impl IntoResponse {
+    let Some(db) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"db not ready"}))).into_response();
+    };
+    let limit = q.limit.unwrap_or(100) as usize;
+    let offset = q.offset.unwrap_or(0) as usize;
+    match db.list_attachments_with_offload(limit, offset).await {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()}))).into_response(),
+    }
+}
+
+async fn process_attachment(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    let Some(db) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"db not ready"})));
+    };
+    let Some(webhook) = state.webhook.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"webhook processor not ready"})));
+    };
+    match db.get_attachment_payload(id).await {
+        Ok(Some(payload)) => match webhook.process_media_upload(payload).await {
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()}))),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok":false,"error":"attachment not found"}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()}))),
     }
 }
 

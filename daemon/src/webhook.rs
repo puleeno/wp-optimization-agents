@@ -82,14 +82,31 @@ impl WebhookProcessor {
                 continue;
             }
 
-            let imgbb_url = imgbb.upload_file(&local_path, std::path::Path::new(&local_path).file_name().and_then(|s| s.to_str())).await?;
+            // upload to imgbb using direct WordPress URL as requested
+            let imgbb_name = std::path::Path::new(&local_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string());
+            let imgbb_url = imgbb.upload_url(&sz.url, imgbb_name.as_deref()).await?;
 
-            let cdn_url = self.db.upsert_cdn_mapping(payload.attachment_id, &sz.size, &sz.url, &imgbb_url, "imgbb").await?;
-            self.db.insert_url_version(payload.attachment_id, &sz.size, "imgbb", &sz.url, &imgbb_url).await?;
+            let cdn_url = self
+                .db
+                .upsert_cdn_mapping(payload.attachment_id, &sz.size, &sz.url, &imgbb_url, "imgbb")
+                .await?;
+            self.db
+                .insert_url_version(payload.attachment_id, &sz.size, "imgbb", &sz.url, &imgbb_url)
+                .await?;
 
             replacements.push((sz.url.clone(), cdn_url.clone()));
-            self.db.enqueue_blogger_upload(payload.attachment_id, payload.post_id, &sz.size, &imgbb_url, &local_path).await?;
-            processed.push(serde_json::json!({"size": sz.size, "wp_url": sz.url, "imgbb_url": imgbb_url, "cdn_url": cdn_url}));
+            self.db
+                .enqueue_blogger_upload(payload.attachment_id, payload.post_id, &sz.size, &imgbb_url, &local_path)
+                .await?;
+            processed.push(serde_json::json!({
+                "size": sz.size,
+                "wp_url": sz.url,
+                "imgbb_url": imgbb_url,
+                "cdn_url": cdn_url
+            }));
         }
 
         if replacements.is_empty() {

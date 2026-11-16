@@ -58,7 +58,6 @@ export default function App() {
   const [daemonMetrics, setDaemonMetrics] = useState<DaemonMetrics | null>(null);
   const [images, setImages] = useState<OffloadImage[]>([]);
   const [dailyAudits, setDailyAudits] = useState<DailyAuditRecord[]>([]);
-  const [posts, setPosts] = useState<WordPressPost[]>([]);
   const [logs, setLogs] = useState<AgentLog[]>([]);
   const [config, setConfig] = useState<AgentConfig | null>(null);
   const [currentTask, setCurrentTask] = useState<any>(null);
@@ -67,7 +66,7 @@ export default function App() {
   const [activeAuditStep, setActiveAuditStep] = useState<number>(0);
   const [loading, setLoading] = useState<boolean>(true);
 
-  const pendingPostsCount = posts.filter((p) => p.offloadedImages < p.totalImages).length;
+  const pendingPostsCount = 0;
 
   useEffect(() => {
     if (darkMode) {
@@ -85,11 +84,10 @@ export default function App() {
   const loadAllData = useCallback(async () => {
     setLoading(true);
     try {
-      const [metrics, imgs, audits, postsData, configData, taskData] = await Promise.all([
+      const [metrics, imgs, audits, configData, taskData] = await Promise.all([
         fetchJson<DaemonMetrics>(`${API_BASE}/metrics`),
         fetchJson<any[]>(`${API_BASE}/images?limit=100`),
         fetchJson<DailyAuditRecord[]>(`${API_BASE}/audits`),
-        fetchJson<WordPressPost[]>(`${API_BASE}/posts?limit=50`),
         fetchJson<AgentConfig>(`${API_BASE}/config`),
         fetchJson<any>(`${API_BASE}/tasks/current`),
       ]);
@@ -114,20 +112,6 @@ export default function App() {
         setImages(mapped);
       }
       if (audits) setDailyAudits(audits);
-      if (postsData) {
-        const mappedPosts: WordPressPost[] = (postsData as any[]).map((p: any) => ({
-          id: p.id,
-          title: p.title || `Post #${p.id}`,
-          slug: p.slug || '',
-          author: p.author || '',
-          publishedDate: p.publishedDate || p.linkedAt || '',
-          status: p.status === 'publish' ? 'publish' : 'draft',
-          totalImages: p.totalImages ?? 0,
-          offloadedImages: p.offloadedImages ?? p.replacedImages ?? 0,
-          images: Array.isArray(p.images) ? p.images : [],
-        }));
-        setPosts(mappedPosts);
-      }
       if (configData) {
         const cd: any = configData;
         const normalized: any = {
@@ -207,23 +191,21 @@ export default function App() {
     setLogs((prev) => [newLog, ...prev]);
   };
 
-  const handleProcessPost = async (postId: number) => {
+  const handleProcessAttachment = async (attachmentId: number) => {
     try {
-      const res = await fetch(`${API_BASE}/posts/${postId}/process`, { method: 'POST' });
+      const res = await fetch(`${API_BASE}/attachments/${attachmentId}/process`, { method: 'POST' });
       const data = await res.json();
-      if (data.ok && data.data) {
+      if (data && data.ok !== false) {
         loadAllData();
       }
     } catch (e) {
-      console.error('Process post failed:', e);
+      console.error('Process attachment failed:', e);
     }
   };
 
-  const handleBatchOffloadAll = async () => {
-    // Process multiple posts sequentially
-    for (const post of posts.filter((p) => p.offloadedImages < p.totalImages)) {
-      await handleProcessPost(post.id);
-    }
+  const handleBatchProcessAttachments = async () => {
+    // Scanner component handles per-item batching via its own fetch; trigger refresh.
+    await loadAllData();
   };
 
   const handleTriggerAudit = async () => {
@@ -342,9 +324,8 @@ export default function App() {
               path="/scanner"
               element={
                 <WordPressScannerTab
-                  posts={posts}
-                  onProcessPost={handleProcessPost}
-                  onBatchOffloadAll={handleBatchOffloadAll}
+                  onProcessAttachment={handleProcessAttachment}
+                  onBatchProcess={handleBatchProcessAttachments}
                 />
               }
             />

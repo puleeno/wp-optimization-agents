@@ -358,9 +358,10 @@ impl Db {
 
     pub async fn list_posts_with_stats(&self, limit: usize, offset: usize) -> Result<Vec<PostStatsRow>> {
         let mut conn = self.pool.get_conn().await?;
+        // Include any post types that use images (posts, pages, products, custom CPTs), excluding revisions/nav items.
         let rows: Vec<Row> = conn.exec(
             format!(
-                "SELECT p.ID, p.post_title, p.post_status,
+                "SELECT p.ID, p.post_title, p.post_status, p.post_type,
                         COUNT(i.id) as total_images,
                         SUM(CASE WHEN i.status IN ('uploaded','replaced') THEN 1 ELSE 0 END) as offloaded_images,
                         SUM(CASE WHEN i.status = 'replaced' THEN 1 ELSE 0 END) as replaced_images,
@@ -371,7 +372,8 @@ impl Db {
                  FROM {} p
                  LEFT JOIN {} i ON i.post_id = p.ID
                  LEFT JOIN {} pm ON pm.post_id = p.ID AND pm.meta_key LIKE '_wpoa_blogger_%'
-                 WHERE p.post_type='post' AND p.post_status IN ('publish','draft','future','private')
+                 WHERE p.post_type NOT IN ('attachment','revision','nav_menu_item','shop_order','shop_order_refund')
+                   AND p.post_status NOT IN ('auto-draft','trash')
                  GROUP BY p.ID
                  ORDER BY p.ID DESC
                  LIMIT :lim OFFSET :off",
@@ -384,6 +386,7 @@ impl Db {
             id: r.get::<i64,_>("ID").unwrap_or(0),
             title: r.get::<String,_>("post_title").unwrap_or_default(),
             status: r.get::<String,_>("post_status").unwrap_or_else(|| "publish".into()),
+            post_type: r.get::<String,_>("post_type").unwrap_or_else(|| "post".into()),
             total_images: r.get::<u64,_>("total_images").unwrap_or(0) as i64,
             offloaded_images: r.get::<u64,_>("offloaded_images").unwrap_or(0) as i64,
             replaced_images: r.get::<u64,_>("replaced_images").unwrap_or(0) as i64,
@@ -589,6 +592,176 @@ impl Db {
         Ok(())
     }
 
+
+    pub async fn list_attachments_with_offload(&self, limit: usize, offset: usize) -> Result<Vec<serde_json::Value>> {
+        let mut conn = self.pool.get_conn().await?;
+        let uploads_base = format!("{}/", self.cfg.site.url.trim_end_matches('/'));
+        let rows: Vec<Row> = conn.exec(
+            format!(
+                "SELECT p.ID as attachment_id,
+                        p.post_parent as parent_post_id,
+                        p.post_title,
+                        p.post_mime_type,
+                        p.guid,
+                        p.post_date,
+                        MAX(CASE WHEN pm.meta_key='_wp_attached_file' THEN pm.meta_value END) as attached_file,
+                        MAX(CASE WHEN pm.meta_key='_wp_attachment_metadata' THEN pm.meta_value END) as attachment_meta,
+                        COALESCE(agg.total_mappings, 0) as total_mappings,
+                        COALESCE(agg.offloaded_mappings, 0) as offloaded_mappings,
+                        COALESCE(agg.replaced_mappings, 0) as replaced_mappings,
+                        COALESCE(agg.failed_mappings, 0) as failed_mappings,
+                        MAX(i.status) as latest_status
+                 FROM {} p
+                 LEFT JOIN {} pm ON pm.post_id = p.ID AND pm.meta_key IN ('_wp_attached_file','_wp_attachment_metadata')
+                 LEFT JOIN (
+                    SELECT attachment_id,
+                           COUNT(*) as total_mappings,
+                           SUM(CASE WHEN status IN ('uploaded','replaced') THEN 1 ELSE 0 END) as offloaded_mappings,
+                           SUM(CASE WHEN status='replaced' THEN 1 ELSE 0 END) as replaced_mappings,
+                           SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_mappings
+                    FROM {} GROUP BY attachment_id
+                 ) agg ON agg.attachment_id = p.ID
+                 LEFT JOIN {} i ON i.attachment_id = p.ID
+                 WHERE p.post_type='attachment'
+                   AND (p.post_mime_type LIKE 'image/%' OR p.post_mime_type = '' )
+                 GROUP BY p.ID
+                 ORDER BY p.ID DESC
+                 LIMIT :lim OFFSET :off",
+                self.posts_table(), self.postmeta_table(), self.images_table(), self.images_table()
+            ),
+            params!{"lim"=> limit as u64, "off"=> offset as u64}
+        ).await?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let attachment_id: i64 = r.get("attachment_id").unwrap_or(0);
+            let attached_file: Option<String> = r.get("attached_file");
+            let guid: Option<String> = r.get("guid");
+            let attachment_meta: Option<String> = r.get("attachment_meta");
+            let mut origin_url = if let Some(f) = attached_file.as_ref() {
+                if f.starts_with("http://") || f.starts_with("https://") { f.clone() } else { format!("{}/wp-content/uploads/{}", self.cfg.site.url.trim_end_matches('/'), f.trim_start_matches('/')) }
+            } else {
+                guid.clone().unwrap_or_default()
+            };
+            if origin_url.is_empty() { origin_url = format!("{}?attachment_id={}", uploads_base.trim_end_matches('/'), attachment_id); }
+            let sizes_count = parse_attachment_sizes_count(attachment_meta.as_deref());
+            let parent_post_id: Option<i64> = r.get("parent_post_id");
+            let affected = self.find_posts_using_urls(&[origin_url.clone()]).await.unwrap_or_default();
+            let mut affected_types: Vec<String> = Vec::new();
+            if !affected.is_empty() {
+                affected_types = self.get_post_types_by_ids(&affected).await.unwrap_or_default();
+            }
+            out.push(serde_json::json!({
+                "id": attachment_id,
+                "attachmentId": attachment_id,
+                "parentPostId": parent_post_id,
+                "title": r.get::<String,_>("post_title").unwrap_or_default(),
+                "mimeType": r.get::<Option<String>,_>("post_mime_type").unwrap_or(None),
+                "originUrl": origin_url,
+                "uploadedAt": r.get::<Option<String>,_>("post_date").unwrap_or(None),
+                "sizesCount": sizes_count,
+                "totalMappings": r.get::<i64,_>("total_mappings").unwrap_or(0),
+                "offloadedMappings": r.get::<i64,_>("offloaded_mappings").unwrap_or(0),
+                "replacedMappings": r.get::<i64,_>("replaced_mappings").unwrap_or(0),
+                "failedMappings": r.get::<i64,_>("failed_mappings").unwrap_or(0),
+                "latestStatus": r.get::<Option<String>,_>("latest_status").unwrap_or(None),
+                "affectedPostIds": affected,
+                "affectedPostTypes": affected_types,
+            }));
+        }
+        Ok(out)
+    }
+
+    pub async fn get_post_types_by_ids(&self, ids: &[i64]) -> Result<Vec<String>> {
+        if ids.is_empty() { return Ok(vec![]); }
+        let mut conn = self.pool.get_conn().await?;
+        let mut types = std::collections::BTreeSet::new();
+        for id in ids {
+            let row: Option<(String,)> = conn.exec_first(
+                format!("SELECT post_type FROM {} WHERE ID=:id", self.posts_table()),
+                params!{"id"=>*id}
+            ).await?;
+            if let Some((t,)) = row { if !t.is_empty() { types.insert(t); } }
+        }
+        Ok(types.into_iter().collect())
+    }
+
+    pub async fn get_attachment_payload(&self, attachment_id: i64) -> Result<Option<crate::webhook::MediaUploadPayload>> {
+        let mut conn = self.pool.get_conn().await?;
+        let row: Option<Row> = conn.exec_first(
+            format!(
+                "SELECT p.ID, p.post_parent, p.guid, p.post_mime_type,
+                        MAX(CASE WHEN pm.meta_key='_wp_attached_file' THEN pm.meta_value END) as attached_file,
+                        MAX(CASE WHEN pm.meta_key='_wp_attachment_metadata' THEN pm.meta_value END) as meta
+                 FROM {posts} p
+                 LEFT JOIN {pm} pm ON pm.post_id=p.ID AND pm.meta_key IN ('_wp_attached_file','_wp_attachment_metadata')
+                 WHERE p.ID=:id AND p.post_type='attachment'
+                 GROUP BY p.ID",
+                posts=self.posts_table(), pm=self.postmeta_table()
+            ),
+            params!{"id"=>attachment_id}
+        ).await?;
+        let Some(r) = row else { return Ok(None); };
+        let attached_file: Option<String> = r.get("attached_file");
+        let meta_raw: Option<String> = r.get("meta");
+        let guid: Option<String> = r.get("guid");
+        let mime: Option<String> = r.get("post_mime_type");
+        let post_parent: Option<i64> = r.get("post_parent");
+
+        let base_url = format!("{}/wp-content/uploads", self.cfg.site.url.trim_end_matches('/'));
+        let full_url = if let Some(f)=attached_file.as_ref() {
+            if f.starts_with("http://") || f.starts_with("https://") { f.clone() } else { format!("{}/{}", base_url, f.trim_start_matches('/')) }
+        } else { guid.clone().unwrap_or_default() };
+        if full_url.is_empty() { return Ok(None); }
+        let full_path = if let Some(f)=attached_file.as_ref() {
+            if f.starts_with("http://") || f.starts_with("https://") { self.url_to_local_path(&full_url) } else { Some(std::path::Path::new(&self.cfg.site.uploads_dir).join(f).to_string_lossy().to_string()) }
+        } else { self.url_to_local_path(&full_url) };
+
+        let mut sizes: Vec<crate::webhook::ImageSizePayload> = Vec::new();
+        // full
+        sizes.push(crate::webhook::ImageSizePayload {
+            size: "full".into(),
+            url: full_url.clone(),
+            path: full_path.clone(),
+            width: None, height: None, mime_type: mime.clone(), file_size: full_path.as_ref().and_then(|p| std::fs::metadata(p).ok().map(|m| m.len() as i64)),
+        });
+
+        if let Some(meta) = meta_raw.as_deref() {
+            // parse sizes from php serialized metadata: key => array(file,width,height,mime-type,filesize)
+            let rel_dir = attached_file.as_deref().and_then(|f| std::path::Path::new(f).parent().map(|p| p.to_string_lossy().to_string())).unwrap_or_default();
+            for cap in regex::Regex::new(r#"s:\d+:"([^"]+)";a:\d+:\{[^}]*?s:4:"file";s:\d+:"([^"]+)""#).unwrap().captures_iter(meta) {
+                let size_name = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let file = cap.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
+                if size_name.is_empty() || file.is_empty() { continue; }
+                if sizes.iter().any(|s| s.size == size_name) { continue; }
+                let rel = if rel_dir.is_empty() { file.clone() } else { format!("{}/{}", rel_dir.trim_end_matches('/'), file) };
+                let url = format!("{}/{}", base_url, rel.trim_start_matches('/'));
+                let path = std::path::Path::new(&self.cfg.site.uploads_dir).join(&rel).to_string_lossy().to_string();
+                // try to parse dimensions/mime/filesize nearby (best-effort)
+                sizes.push(crate::webhook::ImageSizePayload {
+                    size: size_name,
+                    url,
+                    path: Some(path),
+                    width: None, height: None, mime_type: None, file_size: None,
+                });
+            }
+        }
+
+        Ok(Some(crate::webhook::MediaUploadPayload {
+            attachment_id,
+            post_id: post_parent.filter(|p| *p > 0),
+            file: full_path,
+            url: Some(full_url),
+            mime_type: mime,
+            width: None,
+            height: None,
+            file_size: None,
+            sizes,
+        }))
+    }
+
+
+
     pub async fn get_latest_url_for_size(&self, attachment_id: i64, image_size: &str, provider: &str) -> Result<Option<String>> {
         let mut conn = self.pool.get_conn().await?;
         let row: Option<(String,)> = conn.exec_first(
@@ -599,16 +772,33 @@ impl Db {
     }
 
     pub async fn find_posts_using_urls(&self, urls: &[String]) -> Result<Vec<i64>> {
-        if urls.is_empty() { return Ok(vec![]); }
+        if urls.is_empty() {
+            return Ok(vec![]);
+        }
         let mut conn = self.pool.get_conn().await?;
         let mut ids = std::collections::HashSet::new();
-        for u in urls {
-            let rows: Vec<(i64,)> = conn.exec(
-                format!("SELECT ID FROM {} WHERE post_content LIKE :like AND post_type='post'", self.posts_table()),
-                params!{"like"=>format!("%{}%", u)}
-            ).await?;
-            for (id,) in rows { ids.insert(id); }
+        // Search across all post types that can use images (posts, products, pages, CPTs, etc.)
+        // using IN over URL list for exact/fast matching chunks.
+        for chunk in urls.chunks(100) {
+            // batched LIKE scan per URL (covers all post types/CPTs that may use image URLs)
+            for u in chunk {
+                let like = format!("%{}%", u);
+                let rows: Vec<(i64,)> = conn
+                    .exec(
+                        format!(
+                            "SELECT ID FROM {} WHERE (post_content LIKE :like OR post_excerpt LIKE :like) AND post_type NOT IN ('revision','nav_menu_item')",
+                            self.posts_table()
+                        ),
+                        params! { "like" => like },
+                    )
+                    .await?;
+                for (id,) in rows {
+                    ids.insert(id);
+                }
+            }
         }
+        // Also detect usage in postmeta for any of these URLs (thumbnails/builders may store there)
+        // find_posts_using_urls is focused on wp_posts IDs; meta-only refs still replaced globally later.
         let mut v: Vec<i64> = ids.into_iter().collect();
         v.sort();
         Ok(v)
@@ -634,6 +824,8 @@ pub struct PostStatsRow {
     pub id: i64,
     pub title: String,
     pub status: String,
+    #[serde(default)]
+    pub post_type: String,
     pub total_images: i64,
     pub offloaded_images: i64,
     pub replaced_images: i64,
@@ -676,4 +868,17 @@ fn image_meta_from_path(p: &str) -> (Option<i32>, Option<i32>, Option<String>, O
     let mime = match ext.as_str() { "jpg"|"jpeg"=>"image/jpeg", "png"=>"image/png", "gif"=>"image/gif", "webp"=>"image/webp", _=>"application/octet-stream" }.to_string();
     // dimension best-effort skipped (avoid image crate dep)
     (None, None, Some(mime), size)
+}
+
+
+fn parse_attachment_sizes_count(meta: Option<&str>) -> i64 {
+    let Some(m) = meta else { return 1; };
+    // crude php serialized count of sizes array entries: look for s:5:"sizes";a:N:
+    if let Some(idx) = m.find("s:5:\"sizes\";a:") {
+        let rest = &m[idx + "s:5:\"sizes\";a:".len()..];
+        let mut n = String::new();
+        for ch in rest.chars() { if ch.is_ascii_digit() { n.push(ch); } else { break; } }
+        if let Ok(v) = n.parse::<i64>() { return v.max(0) + 1; }
+    }
+    1
 }
