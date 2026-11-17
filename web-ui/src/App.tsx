@@ -12,8 +12,6 @@ import {
   DaemonMetrics,
   OffloadImage,
   DailyAuditRecord,
-  WordPressPost,
-  AgentLog,
   AgentConfig,
 } from './types/dashboard';
 
@@ -64,11 +62,11 @@ export default function App() {
   const [daemonMetrics, setDaemonMetrics] = useState<DaemonMetrics | null>(null);
   const [images, setImages] = useState<OffloadImage[]>([]);
   const [dailyAudits, setDailyAudits] = useState<DailyAuditRecord[]>([]);
-  const [logs, setLogs] = useState<AgentLog[]>([]);
   const [config, setConfig] = useState<AgentConfig | null>(null);
   const [currentTask, setCurrentTask] = useState<any>(null);
 
   const [isAuditing, setIsAuditing] = useState<boolean>(false);
+  const [auditStage, setAuditStage] = useState<string>('');
   const [activeAuditStep, setActiveAuditStep] = useState<number>(0);
   const [loading, setLoading] = useState<boolean>(true);
 
@@ -95,6 +93,10 @@ export default function App() {
     const cd: any = configData;
     const normalized: any = {
       ...cd,
+      site: {
+        ...(cd.site || {}),
+        url: cd.site?.url || '',
+      },
       wordpress: cd.wordpress || {
         endpointUrl: cd.site?.url || '',
         username: '',
@@ -107,7 +109,7 @@ export default function App() {
         port: cd.daemon?.port ?? 2095,
         logLevel: cd.logging?.level ?? 'info',
         workerThreads: cd.daemon?.workerThreads ?? 4,
-        pollIntervalSec: cd.daemon?.poll_interval_sec ?? cd.daemon?.pollIntervalSec ?? 60,
+        pollIntervalSec: cd.daemon?.poll_interval_secs ?? cd.daemon?.poll_interval_sec ?? cd.daemon?.pollIntervalSec ?? 60,
         autoRetryLimit: cd.daemon?.autoRetryLimit ?? 3,
       },
       blogger: {
@@ -124,6 +126,18 @@ export default function App() {
         targetUrls: [],
         slackWebhook: '',
         alertOnLcpAboveMs: 2500,
+      },
+      cdn: {
+        host: cd.cdn?.host ?? 'cdn.nghesachxua.localhost',
+        scheme: cd.cdn?.scheme ?? 'https',
+      },
+      imgbb: {
+        ...(cd.imgbb || {}),
+        enabled: cd.imgbb?.enabled !== false,
+        apiKey: cd.imgbb?.api_key ?? cd.imgbb?.apiKey ?? '',
+        api_key: cd.imgbb?.api_key ?? cd.imgbb?.apiKey ?? '',
+        uploadFormat: cd.imgbb?.upload_format ?? cd.imgbb?.uploadFormat ?? 'url',
+        upload_format: cd.imgbb?.upload_format ?? cd.imgbb?.uploadFormat ?? 'url',
       },
     };
     setConfig(normalized);
@@ -285,17 +299,7 @@ export default function App() {
           : null
       );
     }
-    const newLog: AgentLog = {
-      id: `log-${Date.now()}`,
-      timestamp:
-        new Date().toTimeString().split(' ')[0] +
-        '.' +
-        Math.floor(Math.random() * 900 + 100),
-      level: 'INFO',
-      subsystem: 'media_processor',
-      message: `Uploaded & generated offload URL: ${newImage.bloggerBaseUrl}${newImage.transformedParamString} (Saved ${Math.round(((newImage.originalSizeBytes - newImage.offloadSizeBytes) / newImage.originalSizeBytes) * 100)}%)`,
-    };
-    setLogs((prev) => [newLog, ...prev]);
+    // log captured by daemon /api/logs
   };
 
   const handleProcessAttachment = async (attachmentId: number) => {
@@ -318,42 +322,41 @@ export default function App() {
   const handleTriggerAudit = async () => {
     if (isAuditing) return;
     setIsAuditing(true);
-    setActiveAuditStep(0);
+    setAuditStage('Đang khởi tạo audit...');
 
-    const s1 = setTimeout(() => setActiveAuditStep(1), 700);
-    const s2 = setTimeout(() => setActiveAuditStep(2), 1400);
-    const s3 = setTimeout(() => setActiveAuditStep(3), 2100);
-    const s4 = setTimeout(() => setActiveAuditStep(4), 2800);
+    try {
+      const res = await fetch(`${API_BASE}/audits/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls: [] }),
+      });
+      if (!res.ok) {
+        console.error('audit run failed', res.status, await res.text().catch(() => ''));
+      }
 
-    const sDone = setTimeout(() => {
+      for (let i = 0; i < 180; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const t = await fetchJson<any>(`${API_BASE}/tasks/current`, 5000);
+        const task = t.data?.task ?? null;
+        if (!task || !task.active) break;
+        setAuditStage(task.message || task.stage || 'Đang kiểm tra...');
+        setActiveAuditStep(typeof task.progress_current === 'number' ? task.progress_current : 0);
+      }
+      await loadAllData();
+      setAuditStage('');
+    } catch (e) {
+      console.error('audit trigger failed', e);
+      setAuditStage('');
+    } finally {
       setIsAuditing(false);
       setActiveAuditStep(0);
-      loadAllData(); // Refresh audits
-    }, 3600);
-
-    return () => {
-      clearTimeout(s1);
-      clearTimeout(s2);
-      clearTimeout(s3);
-      clearTimeout(s4);
-      clearTimeout(sDone);
-    };
+    }
   };
 
   const handleSaveConfig = async (newConfig: AgentConfig) => {
     setConfig(newConfig);
     // In real implementation, POST to /api/config
-    const newLog: AgentLog = {
-      id: `log-${Date.now()}`,
-      timestamp:
-        new Date().toTimeString().split(' ')[0] +
-        '.' +
-        Math.floor(Math.random() * 900 + 100),
-      level: 'INFO',
-      subsystem: 'rust_daemon',
-      message: 'Configuration reloaded and validated across config.rs & config.py schema.',
-    };
-    setLogs((prev) => [newLog, ...prev]);
+    // config save is client-side for now; daemon /api/config is read-only
   };
 
   if (loading && !daemonMetrics) {
@@ -390,6 +393,7 @@ export default function App() {
           setDarkMode={setDarkMode}
           onTriggerAudit={handleTriggerAudit}
           isAuditing={isAuditing}
+          auditStage={auditStage}
           onOpenSidebar={() => setSidebarOpen(true)}
         />
 
@@ -423,9 +427,8 @@ export default function App() {
               element={
                 <DaemonEngineTab
                   metrics={daemonMetrics}
-                  setMetrics={setDaemonMetrics}
-                  logs={logs}
-                  setLogs={setLogs}
+                  config={config}
+                  siteUrl={siteUrl}
                 />
               }
             />

@@ -7,7 +7,7 @@ use crate::webhook::{run_blogger_queue_worker, MediaUploadPayload, WebhookProces
 use axum::{extract::{Path, Query, State}, http::StatusCode, response::{sse::{Event, KeepAlive, Sse}, IntoResponse}, routing::{get, post}, Json, Router};
 use futures_util::stream::{self, Stream};
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,6 +26,8 @@ pub struct AppState {
     pub current_task: Arc<RwLock<Option<CurrentTask>>>,
     pub webhook: Option<Arc<WebhookProcessor>>,
     pub http: reqwest::Client,
+    pub started_at: Instant,
+    pub cfg_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -44,6 +46,7 @@ struct MetricsResponse {
     uptime_seconds: u64,
     memory_mb: f64,
     cpu_percent: f64,
+    tokio_workers: u64,
     total_images_offloaded: u64,
     total_bytes_saved: u64,
     active_tasks: u64,
@@ -105,13 +108,7 @@ struct PostResponse {
     linked_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Serialize)]
-struct LogEntry {
-    timestamp: String,
-    level: String,
-    subsystem: String,
-    message: String,
-}
+// LogEntry served from crate::logs
 
 #[derive(Deserialize)]
 struct ListQuery {
@@ -120,9 +117,24 @@ struct ListQuery {
     status: Option<String>,
 }
 
+async fn req_log(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = Instant::now();
+    let res = next.run(req).await;
+    let status = res.status().as_u16();
+    let ms = started.elapsed().as_millis();
+    if method == axum::http::Method::POST || status >= 400 || ms > 2000 {
+        tracing::info!(target: "api_server", stage = "http", method = %method, target = %path, status = status, elapsed_ms = ms as u64, "http request");
+    } else {
+        tracing::debug!(target: "api_server", stage = "http", method = %method, target = %path, status = status, elapsed_ms = ms as u64, "http request");
+    }
+    res
+}
+
 pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
     let index = dist_dir.join("index.html");
-    let static_files = ServeDir::new(dist_dir.clone()).not_found_service(ServeFile::new(index));
+    let static_files = ServeDir::new(dist_dir.clone()).fallback(ServeFile::new(index));
     let api_routes = Router::new()
         .route("/health", get(health))
         .route("/api/health", get(health))
@@ -133,8 +145,10 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/posts", get(list_posts))
         .route("/api/attachments", get(list_attachments))
         .route("/api/logs", get(list_logs))
+        .route("/api/logs/stream", get(list_logs_stream))
         .route("/api/audits", get(list_audits))
-        .route("/api/config", get(get_config))
+        .route("/api/audits/run", post(run_audit))
+        .route("/api/config", get(get_config).put(put_config))
         .route("/api/tasks/current", get(get_current_task))
         .route("/api/tasks/stream", get(get_current_task_stream))
         .route("/api/posts/:id/process", post(process_post))
@@ -149,6 +163,7 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
     Router::new()
         .merge(api_routes)
         .fallback_service(static_files)
+        .layer(axum::middleware::from_fn(req_log))
         .layer(CorsLayer::permissive())
 }
 
@@ -157,22 +172,26 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let engine = state.engine.as_ref();
-    let db = if let Some(e) = engine { e.db() } else { return Json(MetricsResponse { status: "error", pid: std::process::id(), db: false, uptime_seconds: 0, memory_mb: 0.0, cpu_percent: 0.0, total_images_offloaded: 0, total_bytes_saved: 0, active_tasks: 0 }); };
-
-    // Get basic stats from DB
-    let stats = db.get_stats().await.unwrap_or_default();
+    let stats = if let Some(db) = state.db.as_ref() {
+        db.get_stats().await.unwrap_or_default()
+    } else if let Some(e) = state.engine.as_ref() {
+        e.db().get_stats().await.unwrap_or_default()
+    } else {
+        serde_json::json!({})
+    };
     let active_tasks = if state.current_task.read().await.as_ref().map(|t| t.active).unwrap_or(false) { 1 } else { 0 };
-
+    let offloaded = stats.get("replaced").and_then(|v| v.as_u64()).unwrap_or(0)
+        + stats.get("uploaded").and_then(|v| v.as_u64()).unwrap_or(0);
     Json(MetricsResponse {
-        status: "ok",
+        status: "running",
         pid: std::process::id(),
         db: state.db_ok,
-        uptime_seconds: 0, // Would need process start time tracking
-        memory_mb: 0.0, // Would need system info
-        cpu_percent: 0.0,
-        total_images_offloaded: stats.get("replaced").and_then(|v| v.as_u64()).unwrap_or(0),
-        total_bytes_saved: 0, // Would need to calculate
+        uptime_seconds: state.started_at.elapsed().as_secs(),
+        memory_mb: crate::sysinfo_lite::rss_mb().unwrap_or(0.0),
+        cpu_percent: crate::sysinfo_lite::cpu_percent().unwrap_or(0.0),
+        tokio_workers: crate::sysinfo_lite::worker_threads(),
+        total_images_offloaded: offloaded,
+        total_bytes_saved: 0,
         active_tasks,
     })
 }
@@ -266,10 +285,17 @@ async fn list_attachments(State(state): State<AppState>, Query(q): Query<ListQue
     let Some(db) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"db not ready"}))).into_response();
     };
-    let limit = q.limit.unwrap_or(100) as usize;
+    let limit = (q.limit.unwrap_or(100) as usize).clamp(1, 1000);
     let offset = q.offset.unwrap_or(0) as usize;
+    let total = db.count_attachments().await.unwrap_or(0);
     match db.list_attachments_with_offload(limit, offset).await {
-        Ok(items) => Json(items).into_response(),
+        Ok(items) => {
+            let mut res = Json(items).into_response();
+            if let Ok(v) = axum::http::HeaderValue::from_str(&total.to_string()) {
+                res.headers_mut().insert("x-total-count", v);
+            }
+            res
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()}))).into_response(),
     }
 }
@@ -281,24 +307,112 @@ async fn process_attachment(State(state): State<AppState>, Path(id): Path<i64>) 
     let Some(webhook) = state.webhook.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"webhook processor not ready"})));
     };
-    match db.get_attachment_payload(id).await {
+    tracing::info!(target: "api_server", stage = "scan", attachment_id = id, "manual attachment process requested");
+    let res = match db.get_attachment_payload(id).await {
         Ok(Some(payload)) => match webhook.process_media_upload(payload).await {
             Ok(v) => (StatusCode::OK, Json(v)),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()}))),
+            Err(e) => {
+                tracing::error!(target: "webhook", stage = "scan", attachment_id = id, "attachment process failed: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()})))
+            }
         },
-        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok":false,"error":"attachment not found"}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()}))),
+        Ok(None) => {
+            tracing::warn!(target: "api_server", stage = "scan", attachment_id = id, "attachment not found");
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok":false,"error":"attachment not found"})))
+        }
+        Err(e) => {
+            tracing::error!(target: "api_server", stage = "scan", attachment_id = id, "attachment payload load failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()})))
+        }
+    };
+    res
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    level: Option<String>,
+    subsystem: Option<String>,
+    q: Option<String>,
+    attachment_id: Option<i64>,
+    post_id: Option<i64>,
+    task_id: Option<String>,
+}
+
+async fn list_logs(State(state): State<AppState>, Query(q): Query<LogsQuery>) -> impl IntoResponse {
+    let filter = crate::logs::LogFilter {
+        limit: Some(q.limit.unwrap_or(200).clamp(1, 2000)),
+        offset: Some(q.offset.unwrap_or(0)),
+        level: q.level,
+        subsystem: q.subsystem,
+        q: q.q,
+        attachment_id: q.attachment_id,
+        post_id: q.post_id,
+        task_id: q.task_id,
+    };
+    if let Some(db) = state.db.as_ref() {
+        match crate::logs::query(db, &filter).await {
+            Ok((entries, total)) => {
+                let mut res = Json(serde_json::json!({"ok": true, "logs": entries, "total": total})).into_response();
+                if let Ok(v) = axum::http::HeaderValue::from_str(&total.to_string()) {
+                    res.headers_mut().insert("x-total-count", v);
+                }
+                res
+            }
+            Err(e) => {
+                tracing::warn!("query_logs failed, falling back to memory buffer: {}", e);
+                let entries = crate::logs::recent(filter.limit.unwrap_or(200));
+                Json(serde_json::json!({"ok": true, "logs": entries, "total": entries.len(), "degraded": true})).into_response()
+            }
+        }
+    } else {
+        let entries = crate::logs::recent(filter.limit.unwrap_or(200));
+        Json(serde_json::json!({"ok": true, "logs": entries, "total": entries.len()})).into_response()
     }
 }
 
-async fn list_logs(State(_state): State<AppState>) -> impl IntoResponse {
-    // Return recent structured logs - for now return empty
-    // In production, this would query a log store or in-memory buffer
-    Json(Vec::<LogEntry>::new())
+async fn list_logs_stream(State(_state): State<AppState>) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    let st = stream::unfold(0usize, |last_len| async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let all = crate::logs::recent(500);
+        let start = if all.len() >= last_len { last_len } else { 0 };
+        let new_items = if start < all.len() { all[start..].to_vec() } else { Vec::new() };
+        let payload = serde_json::json!({"ok": true, "logs": new_items}).to_string();
+        Some((Ok(Event::default().event("logs").data(payload)), all.len()))
+    });
+    Sse::new(st).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keepalive"))
 }
 
-async fn list_audits(State(_state): State<AppState>) -> impl IntoResponse {
-    Json(Vec::<DailyAuditRecord>::new())
+async fn list_audits(State(state): State<AppState>, Query(q): Query<ListQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(50) as usize;
+    let Some(db) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"db not ready"}))).into_response();
+    };
+    match db.list_audits(limit).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok":false,"error":e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RunAuditBody {
+    urls: Option<Vec<String>>,
+}
+
+async fn run_audit(State(state): State<AppState>, body: Option<Json<RunAuditBody>>) -> impl IntoResponse {
+    let Some(db) = state.db.as_ref().cloned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"db not ready"}))).into_response();
+    };
+    let urls = body.and_then(|b| b.0.urls).unwrap_or_default();
+    let runner = std::sync::Arc::new(crate::audit::AuditRunner::new(db, state.config.clone(), state.current_task.clone()));
+    tokio::spawn(async move {
+        if let Err(e) = runner.run(urls).await {
+            tracing::error!(target: "api_server", stage = "audit", "audit run failed: {}", e);
+        }
+    });
+    tracing::info!(target: "api_server", stage = "audit", "audit run started");
+    (StatusCode::ACCEPTED, Json(serde_json::json!({"ok": true, "started": true}))).into_response()
 }
 
 #[derive(Serialize)]
@@ -327,6 +441,57 @@ struct AuditLocation {
     region: String,
     city: String,
     ttfb_ms: u32,
+}
+
+async fn put_config(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+    let Some(path) = state.cfg_path.clone() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "error": "config path unknown"}))).into_response();
+    };
+    let current: serde_json::Value = match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        Some(v) => v,
+        None => serde_json::json!({}),
+    };
+    let merged = merge_json(current, body);
+    // validate against Config schema
+    match serde_json::from_value::<crate::config::Config>(merged.clone()) {
+        Ok(cfg) => {
+            if let Err(e) = cfg.validate() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response();
+            }
+            let pretty = serde_json::to_string_pretty(&merged).unwrap_or_else(|_| "{}".into());
+            let tmp = format!("{}.tmp", path);
+            if let Err(e) = std::fs::write(&tmp, pretty) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "error": format!("write failed: {e}")}))).into_response();
+            }
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "error": format!("replace failed: {e}")}))).into_response();
+            }
+            tracing::info!(target: "api_server", stage = "config", "config saved to {}", path);
+            Json(serde_json::json!({
+                "ok": true,
+                "path": path,
+                "requires_restart": ["agent.host", "agent.port", "chrome.*", "database.*"],
+                "note": "Đã ghi file config. Khởi động lại daemon để áp dụng host/port/chrome/database."
+            })).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": format!("invalid config: {e}")}))).into_response(),
+    }
+}
+
+fn merge_json(base: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+    match (base, patch) {
+        (serde_json::Value::Object(mut b), serde_json::Value::Object(p)) => {
+            for (k, v) in p {
+                let entry = b.remove(&k).unwrap_or(serde_json::Value::Null);
+                b.insert(k, merge_json(entry, v));
+            }
+            serde_json::Value::Object(b)
+        }
+        (_, p) => p,
+    }
 }
 
 async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
@@ -470,6 +635,9 @@ pub async fn run_server(config: Config, host_override: Option<String>, port_over
         match Db::new((*cfg).clone()) {
             Ok(db) => {
                 if let Err(e) = db.ensure_pipeline_tables().await { tracing::warn!("ensure pipeline tables failed: {}", e); }
+                if let Err(e) = db.ensure_log_table().await { tracing::warn!("ensure log table failed: {}", e); }
+                if let Err(e) = db.ensure_audit_table().await { tracing::warn!("ensure audit table failed: {}", e); }
+                crate::logs::spawn_writer(db.clone()).await;
                 Some(db)
             }
             Err(e) => { tracing::warn!("shared db init failed: {}", e); None }
@@ -490,7 +658,9 @@ pub async fn run_server(config: Config, host_override: Option<String>, port_over
     }
 
     let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().unwrap_or_else(|_| reqwest::Client::new());
-    let state = AppState { config: cfg, engine, db: db_shared, db_ok, current_task, webhook, http };
+    let started_at = Instant::now();
+    let cfg_path = std::env::var("DAEMON_CONFIG").ok();
+    let state = AppState { config: cfg, engine, db: db_shared, db_ok, current_task, webhook, http, started_at, cfg_path };
     let app = create_router(state, dist_dir);
     let addr: SocketAddr = format!("{host}:{port}").parse().map_err(|e| Error::ConfigError(format!("invalid bind addr: {e}")))?;
     tracing::info!("wp-offload-daemon listening on http://{addr} (web-ui + API), chrome={}", default_chrome_path().display());

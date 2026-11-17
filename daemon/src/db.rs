@@ -402,6 +402,114 @@ impl Db {
     pub fn blogger_queue_table(&self) -> String { self.cfg.t("wp_opt_agents_blogger_queue") }
     pub fn cdn_map_table(&self) -> String { self.cfg.t("wp_opt_agents_cdn_map") }
 
+    pub fn audits_table(&self) -> String { self.cfg.t("wp_opt_agents_audits") }
+
+    pub async fn ensure_audit_table(&self) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop(format!(r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                url TEXT NOT NULL,
+                device VARCHAR(16) NOT NULL DEFAULT 'mobile',
+                ok TINYINT(1) NOT NULL DEFAULT 1,
+                score INT NOT NULL DEFAULT 0,
+                status VARCHAR(16) NOT NULL DEFAULT 'passed',
+                lcp DOUBLE NOT NULL DEFAULT 0,
+                cls DOUBLE NOT NULL DEFAULT 0,
+                fcp DOUBLE NOT NULL DEFAULT 0,
+                ttfb_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                load_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                transfer_kb DOUBLE NOT NULL DEFAULT 0,
+                requests INT NOT NULL DEFAULT 0,
+                images INT NOT NULL DEFAULT 0,
+                cdn_images INT NOT NULL DEFAULT 0,
+                notes TEXT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_created (created_at),
+                KEY idx_url (url(191)),
+                KEY idx_status (status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#, self.audits_table())).await?;
+        Ok(())
+    }
+
+    pub async fn insert_audit(&self, r: &crate::audit::AuditResult) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop(
+            format!(
+                "INSERT INTO {} (url, device, ok, score, status, lcp, cls, fcp, ttfb_ms, load_ms, transfer_kb, requests, images, cdn_images, notes)                  VALUES (:url,:device,:ok,:score,:status,:lcp,:cls,:fcp,:ttfb,:load,:kb,:req,:imgs,:cdn,:notes)",
+                self.audits_table()
+            ),
+            params!{
+                "url" => r.url.clone(),
+                "device" => r.device.clone(),
+                "ok" => r.ok,
+                "score" => r.score,
+                "status" => r.status.clone(),
+                "lcp" => r.lcp,
+                "cls" => r.cls,
+                "fcp" => r.fcp,
+                "ttfb" => r.ttfb_ms,
+                "load" => r.load_ms,
+                "kb" => r.transfer_kb,
+                "req" => r.requests,
+                "imgs" => r.images,
+                "cdn" => r.cdn_images,
+                "notes" => r.notes.clone(),
+            },
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn list_audits(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let mut conn = self.pool.get_conn().await?;
+        let rows: Vec<Row> = conn.exec(
+            format!(
+                "SELECT id, url, device, ok, score, status, lcp, cls, fcp, ttfb_ms, load_ms, transfer_kb, requests, images, cdn_images, notes, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') as created_at \
+                 FROM {} ORDER BY id DESC LIMIT {}",
+                self.audits_table(), limit.clamp(1, 500)
+            ),
+            (),
+        ).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let id = r.get::<u64, _>("id").unwrap_or(0);
+                let url = row_opt_string(&r, "url").unwrap_or_default();
+                let device = row_opt_string(&r, "device").unwrap_or_else(|| "mobile".into());
+                let created = row_opt_string(&r, "created_at").unwrap_or_default();
+                let lcp = r.get::<f64, _>("lcp").unwrap_or(0.0);
+                let ttfb = r.get::<u64, _>("ttfb_ms").unwrap_or(0);
+                let score = r.get::<u32, _>("score").unwrap_or(0);
+                let images = r.get::<u32, _>("images").unwrap_or(0);
+                let cdn_images = r.get::<u32, _>("cdn_images").unwrap_or(0);
+                serde_json::json!({
+                    "id": id.to_string(),
+                    "timestamp": created,
+                    "dateStr": created.get(0..10).unwrap_or("").to_string(),
+                    "targetSiteUrl": url,
+                    "device": device,
+                    "lighthouseScore": score,
+                    "lcp": lcp,
+                    "lcpBefore": lcp,
+                    "cls": r.get::<f64, _>("cls").unwrap_or(0.0),
+                    "fcp": r.get::<f64, _>("fcp").unwrap_or(0.0),
+                    "ttfbBloggerMs": ttfb,
+                    "ttfbOriginMs": ttfb,
+                    "bandwidthSavedGb": 0.0,
+                    "imagesAudited": images,
+                    "cdnImages": cdn_images,
+                    "requests": r.get::<u32, _>("requests").unwrap_or(0),
+                    "transferKb": r.get::<f64, _>("transfer_kb").unwrap_or(0.0),
+                    "status": row_opt_string(&r, "status").unwrap_or_else(|| "passed".into()),
+                    "notes": row_opt_string(&r, "notes").unwrap_or_default(),
+                    "locations": [],
+                })
+            })
+            .collect())
+    }
+
     pub async fn ensure_pipeline_tables(&self) -> Result<()> {
         let mut conn = self.pool.get_conn().await?;
         conn.query_drop(format!(r#"
@@ -465,6 +573,142 @@ impl Db {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         "#, self.cdn_map_table())).await?;
         Ok(())
+    }
+
+    pub fn logs_table(&self) -> String { self.cfg.t("wp_opt_agents_logs") }
+
+    pub async fn ensure_log_table(&self) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop(format!(r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                ts DATETIME(3) NOT NULL,
+                level VARCHAR(16) NOT NULL,
+                subsystem VARCHAR(64) NOT NULL,
+                message TEXT NOT NULL,
+                attachment_id BIGINT NULL,
+                post_id BIGINT NULL,
+                task_id VARCHAR(64) NULL,
+                stage VARCHAR(64) NULL,
+                provider VARCHAR(32) NULL,
+                target TEXT NULL,
+                PRIMARY KEY (id),
+                KEY idx_ts (ts),
+                KEY idx_level (level),
+                KEY idx_subsystem (subsystem),
+                KEY idx_attachment (attachment_id),
+                KEY idx_task (task_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#, self.logs_table())).await?;
+        Ok(())
+    }
+
+    pub async fn prune_logs(&self, keep_days: i64, keep_rows: i64) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop(
+            format!("DELETE FROM {} WHERE ts < (NOW() - INTERVAL {} DAY)", self.logs_table(), keep_days),
+            (),
+        ).await?;
+        conn.exec_drop(
+            format!(
+                "DELETE FROM {} WHERE id < (SELECT min_id FROM (SELECT GREATEST(CAST(MAX(id) AS SIGNED) - {}, 0) AS min_id FROM {}) t)",
+                self.logs_table(),
+                keep_rows,
+                self.logs_table()
+            ),
+            (),
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn insert_logs(&self, entries: &[crate::logs::LogEntry]) -> Result<()> {
+        if entries.is_empty() { return Ok(()); }
+        let mut conn = self.pool.get_conn().await?;
+        let sql = format!(
+            "INSERT INTO {} (ts, level, subsystem, message, attachment_id, post_id, task_id, stage, provider, target)              VALUES (:ts,:level,:subsystem,:message,:attachment_id,:post_id,:task_id,:stage,:provider,:target)",
+            self.logs_table()
+        );
+        for e in entries {
+            let ts = chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+                .unwrap_or_else(|_| e.timestamp.clone());
+            conn.exec_drop(&sql, params!{
+                "ts" => ts,
+                "level" => e.level.clone(),
+                "subsystem" => e.subsystem.clone(),
+                "message" => e.message.clone(),
+                "attachment_id" => e.attachment_id,
+                "post_id" => e.post_id,
+                "task_id" => e.task_id.clone(),
+                "stage" => e.stage.clone(),
+                "provider" => e.provider.clone(),
+                "target" => e.target.clone(),
+            }).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn query_logs(&self, f: &crate::logs::LogFilter) -> Result<(Vec<crate::logs::LogEntry>, i64)> {
+        let mut conn = self.pool.get_conn().await?;
+        let mut where_parts: Vec<String> = Vec::new();
+        if let Some(level) = f.level.as_ref().filter(|v| !v.is_empty() && v.as_str() != "ALL") {
+            where_parts.push(format!("level = '{}'", level.replace('\'', "''")));
+        }
+        if let Some(sub) = f.subsystem.as_ref().filter(|v| !v.is_empty() && v.as_str() != "ALL") {
+            where_parts.push(format!("subsystem = '{}'", sub.replace('\'', "''")));
+        }
+        if let Some(aid) = f.attachment_id {
+            where_parts.push(format!("attachment_id = {}", aid));
+        }
+        if let Some(pid) = f.post_id {
+            where_parts.push(format!("post_id = {}", pid));
+        }
+        if let Some(task) = f.task_id.as_ref().filter(|v| !v.is_empty()) {
+            where_parts.push(format!("task_id = '{}'", task.replace('\'', "''")));
+        }
+        if let Some(q) = f.q.as_ref().filter(|v| !v.trim().is_empty()) {
+            let like = format!("%{}%", q.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_").replace('\'', "''"));
+            where_parts.push(format!("(message LIKE '{}' OR target LIKE '{}')", like, like));
+        }
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_parts.join(" AND "))
+        };
+
+        let total: Option<(i64,)> = conn
+            .exec_first(format!("SELECT COUNT(*) FROM {}{}", self.logs_table(), where_sql), ())
+            .await?;
+        let total = total.map(|r| r.0).unwrap_or(0);
+
+        let limit = (f.limit.unwrap_or(200) as u64).clamp(1, 2000);
+        let offset = f.offset.unwrap_or(0) as u64;
+        let rows: Vec<Row> = conn
+            .exec(
+                format!(
+                    "SELECT DATE_FORMAT(ts, '%Y-%m-%dT%H:%i:%s.%f') as ts, level, subsystem, message, attachment_id, post_id, task_id, stage, provider, target                      FROM {}{} ORDER BY id DESC LIMIT {} OFFSET {}",
+                    self.logs_table(), where_sql, limit, offset
+                ),
+                (),
+            )
+            .await?;
+
+        let out = rows
+            .into_iter()
+            .map(|r| crate::logs::LogEntry {
+                timestamp: row_opt_string(&r, "ts").unwrap_or_default(),
+                level: row_opt_string(&r, "level").unwrap_or_default(),
+                subsystem: row_opt_string(&r, "subsystem").unwrap_or_default(),
+                message: row_opt_string(&r, "message").unwrap_or_default(),
+                attachment_id: r.get::<Option<i64>, _>("attachment_id").unwrap_or(None),
+                post_id: r.get::<Option<i64>, _>("post_id").unwrap_or(None),
+                task_id: row_opt_string(&r, "task_id"),
+                stage: row_opt_string(&r, "stage"),
+                provider: row_opt_string(&r, "provider"),
+                target: row_opt_string(&r, "target"),
+            })
+            .collect();
+        Ok((out, total))
     }
 
     pub async fn insert_url_version(&self, attachment_id: i64, image_size: &str, provider: &str, old_url: &str, new_url: &str) -> Result<()> {
@@ -593,6 +837,18 @@ impl Db {
     }
 
 
+    pub async fn count_attachments(&self) -> Result<i64> {
+        let mut conn = self.pool.get_conn().await?;
+        let row: Option<(i64,)> = conn.exec_first(
+            format!(
+                "SELECT COUNT(*) FROM {} WHERE post_type='attachment' AND (post_mime_type LIKE 'image/%' OR post_mime_type = '')",
+                self.posts_table()
+            ),
+            ()
+        ).await?;
+        Ok(row.map(|r| r.0).unwrap_or(0))
+    }
+
     pub async fn list_attachments_with_offload(&self, limit: usize, offset: usize) -> Result<Vec<serde_json::Value>> {
         let mut conn = self.pool.get_conn().await?;
         let uploads_base = format!("{}/", self.cfg.site.url.trim_end_matches('/'));
@@ -603,14 +859,14 @@ impl Db {
                         p.post_title,
                         p.post_mime_type,
                         p.guid,
-                        p.post_date,
+                        CAST(p.post_date AS CHAR) as post_date,
                         MAX(CASE WHEN pm.meta_key='_wp_attached_file' THEN pm.meta_value END) as attached_file,
                         MAX(CASE WHEN pm.meta_key='_wp_attachment_metadata' THEN pm.meta_value END) as attachment_meta,
-                        COALESCE(agg.total_mappings, 0) as total_mappings,
-                        COALESCE(agg.offloaded_mappings, 0) as offloaded_mappings,
-                        COALESCE(agg.replaced_mappings, 0) as replaced_mappings,
-                        COALESCE(agg.failed_mappings, 0) as failed_mappings,
-                        MAX(i.status) as latest_status
+                        MAX(COALESCE(agg.total_mappings, 0)) as total_mappings,
+                        MAX(COALESCE(agg.offloaded_mappings, 0)) as offloaded_mappings,
+                        MAX(COALESCE(agg.replaced_mappings, 0)) as replaced_mappings,
+                        MAX(COALESCE(agg.failed_mappings, 0)) as failed_mappings,
+                        MAX(agg.latest_status) as latest_status
                  FROM {} p
                  LEFT JOIN {} pm ON pm.post_id = p.ID AND pm.meta_key IN ('_wp_attached_file','_wp_attachment_metadata')
                  LEFT JOIN (
@@ -618,16 +874,16 @@ impl Db {
                            COUNT(*) as total_mappings,
                            SUM(CASE WHEN status IN ('uploaded','replaced') THEN 1 ELSE 0 END) as offloaded_mappings,
                            SUM(CASE WHEN status='replaced' THEN 1 ELSE 0 END) as replaced_mappings,
-                           SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_mappings
+                           SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_mappings,
+                           MAX(status) as latest_status
                     FROM {} GROUP BY attachment_id
                  ) agg ON agg.attachment_id = p.ID
-                 LEFT JOIN {} i ON i.attachment_id = p.ID
                  WHERE p.post_type='attachment'
                    AND (p.post_mime_type LIKE 'image/%' OR p.post_mime_type = '' )
                  GROUP BY p.ID
                  ORDER BY p.ID DESC
                  LIMIT :lim OFFSET :off",
-                self.posts_table(), self.postmeta_table(), self.images_table(), self.images_table()
+                self.posts_table(), self.postmeta_table(), self.images_table()
             ),
             params!{"lim"=> limit as u64, "off"=> offset as u64}
         ).await?;
@@ -835,6 +1091,28 @@ pub struct PostStatsRow {
     pub linked_at: Option<String>,
 }
 
+fn value_to_opt_string(v: mysql_async::Value) -> Option<String> {
+    match v {
+        mysql_async::Value::NULL => None,
+        mysql_async::Value::Bytes(b) => Some(String::from_utf8_lossy(&b).to_string()),
+        mysql_async::Value::Int(i) => Some(i.to_string()),
+        mysql_async::Value::UInt(u) => Some(u.to_string()),
+        mysql_async::Value::Float(f) => Some(f.to_string()),
+        mysql_async::Value::Double(d) => Some(d.to_string()),
+        mysql_async::Value::Date(y, mo, d, h, mi, s, _) => {
+            Some(format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s))
+        }
+        mysql_async::Value::Time(neg, days, h, mi, s, _) => {
+            Some(format!("{}{}:{:02}:{:02}:{:02}", if neg { "-" } else { "" }, days, h, mi, s))
+        }
+    }
+}
+
+fn row_opt_string(r: &Row, key: &str) -> Option<String> {
+    let v: Option<mysql_async::Value> = r.get(key);
+    v.and_then(value_to_opt_string)
+}
+
 fn row_to_image(r: Row) -> ImageMapRow {
     ImageMapRow {
         id: r.get::<i64,_>("id").unwrap_or(0),
@@ -854,9 +1132,9 @@ fn row_to_image(r: Row) -> ImageMapRow {
         redirect_active: r.get::<i32,_>("redirect_active").unwrap_or(0),
         error_message: r.get("error_message"),
         metadata: r.get("metadata"),
-        created_at: r.get("created_at"),
-        updated_at: r.get("updated_at"),
-        replaced_at: r.get("replaced_at"),
+        created_at: row_opt_string(&r, "created_at"),
+        updated_at: row_opt_string(&r, "updated_at"),
+        replaced_at: row_opt_string(&r, "replaced_at"),
     }
 }
 

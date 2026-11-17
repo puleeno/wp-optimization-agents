@@ -44,7 +44,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   siteUrl,
 }) => {
   const siteLabel = siteUrl ? siteUrl.replace(/^https?:\/\//, '').replace(/\/$/, '') : 'WordPress site';
-  const metrics = daemonMetrics || { status: 'stopped', pid: 0, memoryUsageMb: 0, cpuPercent: 0, tokioWorkers: 0 } as any;
+  const metrics: any = daemonMetrics || { status: 'stopped', pid: 0, memoryUsageMb: 0, cpuPercent: 0, tokioWorkers: 0 };
   const mainNavItems = [
     {
       id: 'overview',
@@ -78,7 +78,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     },
     {
       id: 'daemon_engine',
-      label: 'Rust & Python Daemon',
+      label: 'Rust Daemon (Tokio)',
       icon: Cpu,
       badge: 'Tokio',
       badgeColor: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-mono',
@@ -120,7 +120,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   WP OptiAgent
                 </span>
                 <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono block mt-1">
-                  Rust Tokio · PyO3 v2.4
+                  Rust Tokio · Axum
                 </span>
               </div>
             </div>
@@ -245,7 +245,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-200">
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    metrics.status === 'running'
+                    metrics.status === 'running' || metrics.status === 'ok'
                       ? 'bg-emerald-500 ring-2 ring-emerald-500/20'
                       : 'bg-rose-500'
                   }`}
@@ -258,10 +258,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
 
             <div className="grid grid-cols-2 gap-1 text-[11px] font-mono text-slate-500 dark:text-slate-400 pt-1 border-t border-slate-200/60 dark:border-slate-800/60">
-              <div>RAM: {metrics.memoryUsageMb}MB</div>
-              <div>CPU: {metrics.cpuPercent}%</div>
-              <div>Tokio: {metrics.tokioWorkers}T</div>
-              <div>PyO3: OK</div>
+              <div>RAM: {metrics.memoryUsageMb != null ? `${metrics.memoryUsageMb.toFixed(1)}MB` : '—'}</div>
+              <div>CPU: {metrics.cpuPercent != null ? `${metrics.cpuPercent.toFixed(1)}%` : '—'}</div>
+              <div>Tokio: {metrics.tokioWorkers ?? '—'}T</div>
+              <div>DB: {metrics.db ? 'OK' : 'ERR'}</div>
             </div>
           </div>
 

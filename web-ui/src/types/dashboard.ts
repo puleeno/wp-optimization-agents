@@ -125,4 +125,22 @@ export interface AgentConfig {
     slackWebhook: string;
     alertOnLcpAboveMs: number;
   };
+  cdn?: {
+    host: string;
+    scheme: string;
+  };
+  imgbb?: {
+    apiKey?: string;
+    api_key?: string;
+    enabled: boolean;
+    uploadFormat?: string;
+    upload_format?: string;
+  };
+  site?: {
+    url?: string;
+    uploadsDir?: string;
+    uploads_dir?: string;
+    wpPath?: string;
+    wp_path?: string;
+  };
 }

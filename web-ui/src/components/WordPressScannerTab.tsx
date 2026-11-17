@@ -39,21 +39,29 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
 }) => {
   const [items, setItems] = useState<AttachmentItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [pageSize, setPageSize] = useState(200);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'processing' | 'done' | 'failed'>('all');
   const [processingId, setProcessingId] = useState<number | null>(null);
   const [batchRunning, setBatchRunning] = useState(false);
 
-  const load = async () => {
+  const load = async (targetPage?: number) => {
     try {
+      const p = targetPage ?? page;
       setLoading(true);
       setError(null);
-      const res = await fetch('/api/attachments?limit=200');
+      const offset = p * pageSize;
+      const res = await fetch(`/api/attachments?limit=${pageSize}&offset=${offset}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const arr = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : []);
+      const totalCount = Number(res.headers.get('x-total-count') || 0);
       setItems(arr);
+      if (totalCount > 0) setTotal(totalCount);
+      setPage(p);
     } catch (e: any) {
       setError(e?.message || 'Không tải được danh sách media');
     } finally {
@@ -61,7 +69,7 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(0); }, [pageSize]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const deriveState = (it: AttachmentItem) => {
     const off = Number(it.offloadedMappings || 0);
@@ -96,7 +104,7 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
       else if (st === 'done') done++;
       else failed++;
     }
-    return { total: items.length, pending, processing, done, failed };
+    return { total: Math.max(total, items.length), pending, processing, done, failed };
   }, [items]);
 
   const processOne = async (id: number) => {
@@ -122,7 +130,7 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
           await processOne(it.id);
         }
       }
-      await load();
+      await load(page);
     } finally {
       setBatchRunning(false);
     }
@@ -145,7 +153,18 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={load} className="px-3 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800">Tải lại</button>
+          <select
+            value={pageSize}
+            onChange={(e) => setPageSize(Number(e.target.value))}
+            className="px-2 py-2 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+            title="Số media mỗi trang"
+          >
+            <option value={100}>100/trang</option>
+            <option value={200}>200/trang</option>
+            <option value={500}>500/trang</option>
+            <option value={1000}>1000/trang</option>
+          </select>
+          <button onClick={() => load(page)} className="px-3 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800">Tải lại</button>
           <button
             onClick={processBatch}
             disabled={batchRunning || counts.pending + counts.processing + counts.failed === 0}
@@ -237,6 +256,7 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
                       {it.latestStatus && <div className="text-[11px] text-slate-400 font-mono mt-0.5">{it.latestStatus}</div>}
                     </td>
                     <td className="py-3 px-4 text-right">
+                      <div className="inline-flex items-center gap-1.5">
                       <button
                         onClick={() => processOne(it.id)}
                         disabled={processingId === it.id}
@@ -244,6 +264,14 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
                       >
                         {processingId === it.id ? 'Đang xử lý...' : 'Upload imgbb + queue'}
                       </button>
+                      <a
+                        href={`/daemon?attachmentId=${it.id}`}
+                        className="px-2.5 py-1 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 rounded font-medium"
+                        title="Xem log xử lý của media này"
+                      >
+                        Log
+                      </a>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -256,6 +284,43 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
               )}
             </tbody>
           </table>
+        </div>
+
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-4 py-3 border-t border-slate-200 dark:border-slate-800 text-xs bg-slate-50/60 dark:bg-slate-800/30">
+          <div className="text-slate-500 dark:text-slate-400">
+            Hiển thị <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">{items.length}</span> / <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">{total.toLocaleString()}</span> media
+            {total > 0 && <> · Trang <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">{page + 1}</span>/<span className="font-mono">{Math.max(1, Math.ceil(total / pageSize))}</span></>}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => load(0)}
+              disabled={loading || page === 0}
+              className="px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:bg-white dark:hover:bg-slate-900"
+            >
+              « Đầu
+            </button>
+            <button
+              onClick={() => load(Math.max(0, page - 1))}
+              disabled={loading || page === 0}
+              className="px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:bg-white dark:hover:bg-slate-900"
+            >
+              ‹ Trước
+            </button>
+            <button
+              onClick={() => load(page + 1)}
+              disabled={loading || (total > 0 && (page + 1) * pageSize >= total)}
+              className="px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:bg-white dark:hover:bg-slate-900"
+            >
+              Sau ›
+            </button>
+            <button
+              onClick={() => load(Math.max(0, Math.ceil(total / pageSize) - 1))}
+              disabled={loading || total === 0 || (page + 1) * pageSize >= total}
+              className="px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:bg-white dark:hover:bg-slate-900"
+            >
+              Cuối »
+            </button>
+          </div>
         </div>
       </div>
     </div>

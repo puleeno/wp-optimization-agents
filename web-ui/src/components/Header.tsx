@@ -21,6 +21,7 @@ interface HeaderProps {
   setDarkMode: (val: boolean) => void;
   onTriggerAudit: () => void;
   isAuditing: boolean;
+  auditStage?: string;
   onOpenSidebar: () => void;
 }
 
@@ -75,18 +76,18 @@ export const Header: React.FC<HeaderProps> = ({
             <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  daemonMetrics.status === 'running'
+                  (daemonMetrics as any)?.status === 'running' || (daemonMetrics as any)?.status === 'ok'
                     ? 'bg-emerald-500 ring-2 ring-emerald-500/20'
                     : 'bg-rose-500'
                 }`}
               />
               <span className="font-mono text-[11px]">
-                Rust Daemon (Tokio): {daemonMetrics.status.toUpperCase()}
+                Rust Daemon (Tokio): {String((daemonMetrics as any)?.status || 'unknown').toUpperCase()}
               </span>
             </div>
 
             <span className="text-slate-400 font-mono text-[11px]">
-              Lưu lượng: {daemonMetrics.totalImagesOffloaded.toLocaleString()} ảnh
+              Lưu lượng: {((daemonMetrics as any)?.totalImagesOffloaded ?? 0).toLocaleString()} ảnh
             </span>
           </div>
 
@@ -112,7 +113,7 @@ export const Header: React.FC<HeaderProps> = ({
               {isAuditing ? (
                 <>
                   <RotateCw className="w-3.5 h-3.5 animate-spin" />
-                  <span>Đang test...</span>
+                  <span>{auditStage ? auditStage.slice(0, 28) : 'Đang test...'}</span>
                 </>
               ) : (
                 <>

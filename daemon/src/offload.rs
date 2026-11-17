@@ -7,7 +7,7 @@ use crate::wp_api::{WpApiClient, WpImage, WpPostStatusResponse};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct CurrentTask {
@@ -71,7 +71,7 @@ impl OffloadEngine {
     /// 5. Link blogger post in plugin
     /// 6. Mark images replaced in plugin (triggers 301 redirects + URL replacement)
     pub async fn process_post(&self, post_id: i64) -> Result<serde_json::Value> {
-        info!(post_id, "processing post via WP REST API");
+        info!(target: "offload_worker", stage = "post_process", post_id = post_id, "processing post via WP REST API");
         self.update_stage("fetching", format!("Đang lấy trạng thái ảnh của bài viết #{}", post_id), 0, 1, Some(post_id)).await;
 
         // 1. Get post status from plugin
@@ -101,7 +101,7 @@ impl OffloadEngine {
             .collect();
 
         if paths.is_empty() {
-            warn!(post_id, "no local files found for images");
+            warn!(target: "offload_worker", stage = "post_process", post_id = post_id, "no local files found for images");
             self.set_task(None).await;
             return Ok(serde_json::json!({"post_id": post_id, "status":"no_local_files", "uploaded":0, "replaced":0}));
         }
@@ -165,7 +165,7 @@ impl OffloadEngine {
         let mut replaced_count = 0;
         for (idx, im) in to_upload.iter().enumerate() {
             if let Err(e) = self.wp_api.mark_image_replaced(im.id).await {
-                warn!(image_id = im.id, error = %e, "failed to mark replaced in plugin");
+                warn!(target: "offload_worker", stage = "replace", post_id = post_id, "failed to mark replaced in plugin: {}", e);
             } else {
                 replaced_count += 1;
             }
@@ -231,13 +231,13 @@ impl OffloadEngine {
                 Ok(ids) => {
                     for pid in ids {
                         match self.process_post(pid).await {
-                            Ok(r) => info!(post_id=pid, result=%r, "post processed"),
-                            Err(e) => warn!(post_id=pid, error=%e, "post process failed"),
+                            Ok(r) => info!(target: "offload_worker", stage = "post_process", post_id = pid, result = %r, "post processed"),
+                            Err(e) => warn!(target: "offload_worker", stage = "post_process", post_id = pid, "post process failed: {}", e),
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                 }
-                Err(e) => warn!("poll list posts failed: {}", e),
+                Err(e) => warn!(target: "offload_worker", stage = "poll", "poll list posts failed: {}", e),
             }
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         }

@@ -3,7 +3,7 @@ use crate::error::{Error, Result};
 use crate::imgbb::ImgbbClient;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ImageSizePayload {
@@ -48,7 +48,7 @@ impl WebhookProcessor {
     }
 
     pub async fn process_media_upload(&self, payload: MediaUploadPayload) -> Result<serde_json::Value> {
-        info!(attachment_id = payload.attachment_id, "processing media upload webhook");
+        info!(target: "webhook", stage = "receive", attachment_id = payload.attachment_id, post_id = payload.post_id, sizes = payload.sizes.len(), "media upload webhook received");
         self.db.ensure_pipeline_tables().await?;
 
         let mut all_sizes = payload.sizes.clone();
@@ -66,7 +66,13 @@ impl WebhookProcessor {
             }
         }
 
-        let imgbb = self.imgbb.as_ref().ok_or_else(|| Error::ConfigError("imgbb.api_key not configured/enabled".into()))?;
+        let imgbb = match self.imgbb.as_ref() {
+            Some(c) => c,
+            None => {
+                error!(target: "webhook", stage = "config", provider = "imgbb", attachment_id = payload.attachment_id, "imgbb.api_key not configured/enabled - cannot process media upload");
+                return Err(Error::ConfigError("imgbb.api_key not configured/enabled".into()));
+            }
+        };
 
         let mut replacements: Vec<(String, String)> = Vec::new();
         let mut processed = Vec::new();
@@ -74,25 +80,32 @@ impl WebhookProcessor {
         for sz in &all_sizes {
             let local = sz.path.clone().or_else(|| self.url_to_local(&sz.url));
             let Some(local_path) = local else {
-                warn!(size=%sz.size, url=%sz.url, "no local path");
+                warn!(target: "webhook", stage = "local_path", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %sz.url, "no local path for size");
                 continue;
             };
             if !std::path::Path::new(&local_path).exists() {
-                warn!(path=%local_path, "file missing");
+                warn!(target: "webhook", stage = "local_path", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %local_path, "file missing on disk");
                 continue;
             }
+            info!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %sz.url, mode = %self.cfg.imgbb.upload_format, "uploading size to imgbb");
 
             let imgbb_name = std::path::Path::new(&local_path)
                 .file_name()
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_string());
-            let imgbb_url = match self.cfg.imgbb.upload_format.as_str() {
-                "blob" | "binary" | "file" => {
-                    imgbb.upload_blob(&local_path, imgbb_name.as_deref()).await?
+            let started = std::time::Instant::now();
+            let imgbb_res = match self.cfg.imgbb.upload_format.as_str() {
+                "blob" | "binary" | "file" => imgbb.upload_blob(&local_path, imgbb_name.as_deref()).await,
+                _ => imgbb.upload_url(&sz.url, imgbb_name.as_deref()).await,
+            };
+            let imgbb_url = match imgbb_res {
+                Ok(u) => {
+                    info!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %u, elapsed_ms = started.elapsed().as_millis() as u64, "imgbb upload ok");
+                    u
                 }
-                _ => {
-                    // default "url": upload using direct WordPress image URL (imgbb fetches it)
-                    imgbb.upload_url(&sz.url, imgbb_name.as_deref()).await?
+                Err(e) => {
+                    error!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %sz.url, "imgbb upload failed: {}", e);
+                    return Err(e);
                 }
             };
 
@@ -100,6 +113,7 @@ impl WebhookProcessor {
                 .db
                 .upsert_cdn_mapping(payload.attachment_id, &sz.size, &sz.url, &imgbb_url, "imgbb")
                 .await?;
+            info!(target: "webhook", stage = "cdn_map", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %cdn_url, "cdn mapping -> imgbb (pending blogger)");
             self.db
                 .insert_url_version(payload.attachment_id, &sz.size, "imgbb", &sz.url, &imgbb_url)
                 .await?;
@@ -108,6 +122,7 @@ impl WebhookProcessor {
             self.db
                 .enqueue_blogger_upload(payload.attachment_id, payload.post_id, &sz.size, &imgbb_url, &local_path)
                 .await?;
+            info!(target: "webhook", stage = "queue", provider = "blogger", attachment_id = payload.attachment_id, size = %sz.size, target = %imgbb_url, "queued for blogger upload");
             processed.push(serde_json::json!({
                 "size": sz.size,
                 "wp_url": sz.url,
@@ -121,7 +136,12 @@ impl WebhookProcessor {
         }
 
         let replaced_posts = self.db.replace_urls_in_posts_by_in(&replacements).await.unwrap_or(0);
-        let _ = self.db.replace_urls_in_postmeta_and_options(&replacements).await;
+        info!(target: "webhook", stage = "replace", provider = "wp_db", attachment_id = payload.attachment_id, replaced_posts = replaced_posts, "wp post content urls replaced");
+        match self.db.replace_urls_in_postmeta_and_options(&replacements).await {
+            Ok(n) if n > 0 => info!(target: "webhook", stage = "replace", provider = "wp_db", attachment_id = payload.attachment_id, replaced_meta = n, "wp postmeta/options urls replaced"),
+            Ok(_) => debug!(target: "webhook", stage = "replace", provider = "wp_db", attachment_id = payload.attachment_id, "no postmeta/options replacements"),
+            Err(e) => warn!(target: "webhook", stage = "replace", provider = "wp_db", attachment_id = payload.attachment_id, "postmeta/options replace failed: {}", e),
+        }
 
         let mut deleted = 0usize;
         for sz in &all_sizes {
@@ -131,6 +151,8 @@ impl WebhookProcessor {
                 }
             }
         }
+
+        info!(target: "webhook", stage = "done", provider = "imgbb", attachment_id = payload.attachment_id, queued = replacements.len(), replaced_posts = replaced_posts, deleted_files = deleted, "media upload processed");
 
         Ok(serde_json::json!({
             "ok": true,
@@ -180,6 +202,7 @@ pub async fn run_blogger_queue_worker(
         }
 
         for (job_id, attachment_id, _post_id, image_size, source_url, _local_path) in jobs {
+            info!(target: "webhook", stage = "blogger_job", provider = "blogger", attachment_id = attachment_id, size = %image_size, target = %source_url, job_id = job_id, "blogger job picked");
             let _ = processor.db.mark_blogger_job_status(job_id, "processing", None, None).await;
 
             let tmp_path = std::env::temp_dir().join(format!("wpoa_{}_{}.img", attachment_id, image_size.replace([':', '/'], "_")));
@@ -192,9 +215,11 @@ pub async fn run_blogger_queue_worker(
             .await;
 
             if let Err(e) = download_ok {
+                warn!(target: "webhook", stage = "blogger_job", provider = "blogger", attachment_id = attachment_id, size = %image_size, target = %source_url, "blogger job download failed: {}", e);
                 let _ = processor.db.mark_blogger_job_status(job_id, "failed", None, Some(&e)).await;
                 continue;
             }
+            debug!(target: "webhook", stage = "blogger_job", provider = "blogger", attachment_id = attachment_id, size = %image_size, "source downloaded for blogger upload");
 
             let chrome = cfg
                 .chrome
@@ -210,11 +235,13 @@ pub async fn run_blogger_queue_worker(
             let cdp = match Cdp::launch_and_connect(&chrome, &PathBuf::from(&user_data), &profile, cfg.chrome.headless, cfg.chrome.remote_debugging_port, cfg.chrome.launch_timeout_secs).await {
                 Ok(c) => c,
                 Err(e) => {
+                    warn!(target: "webhook", stage = "blogger_job", provider = "chrome_cdp", attachment_id = attachment_id, size = %image_size, "chrome launch failed: {}", e);
                     let _ = processor.db.mark_blogger_job_status(job_id, "failed", None, Some(&e.to_string())).await;
                     let _ = tokio::fs::remove_file(&tmp_path).await;
                     continue;
                 }
             };
+            info!(target: "webhook", stage = "blogger_job", provider = "chrome_cdp", attachment_id = attachment_id, size = %image_size, "chrome cdp connected; uploading to blogger");
 
             let title = format!("Media {} {}", attachment_id, image_size);
             let res = blogger::upload_images_for_post(&cdp, &cfg.blogger.blog_id, &title, None, &[tmp_path.to_string_lossy().to_string()]).await;
@@ -228,12 +255,14 @@ pub async fn run_blogger_queue_worker(
                         let _ = processor.db.insert_url_version(attachment_id, &image_size, "blogger", &source_url, &blogger_url).await;
                         let _ = processor.db.set_cdn_target_latest_blogger(attachment_id, &image_size, &blogger_url).await;
                         let _ = processor.db.mark_blogger_job_status(job_id, "done", Some(&blogger_url), None).await;
-                        info!(attachment_id, size=%image_size, "blogger queue job done; CDN switched to blogger");
+                        info!(target: "webhook", stage = "blogger_job", provider = "blogger", attachment_id = attachment_id, size = %image_size, target = %blogger_url, "blogger upload done; CDN switched to blogger");
                     } else {
+                        warn!(target: "webhook", stage = "blogger_job", provider = "blogger", attachment_id = attachment_id, size = %image_size, "blogger upload returned no result");
                         let _ = processor.db.mark_blogger_job_status(job_id, "failed", None, Some("no upload result")).await;
                     }
                 }
                 Err(e) => {
+                    error!(target: "webhook", stage = "blogger_job", provider = "blogger", attachment_id = attachment_id, size = %image_size, "blogger upload failed: {}", e);
                     let _ = processor.db.mark_blogger_job_status(job_id, "failed", None, Some(&e.to_string())).await;
                 }
             }
