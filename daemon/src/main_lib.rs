@@ -28,6 +28,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub started_at: Instant,
     pub cfg_path: Option<String>,
+    /// Live config (updated on PUT /api/config without restart)
+    pub config_live: Arc<RwLock<crate::config::Config>>,
 }
 
 #[derive(Serialize)]
@@ -153,6 +155,9 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/tasks/stream", get(get_current_task_stream))
         .route("/api/posts/:id/process", post(process_post))
         .route("/api/attachments/:id/process", post(process_attachment))
+        .route("/api/scan/run", post(run_scan))
+        .route("/api/scan/status", get(scan_status))
+        .route("/api/chrome/preflight", get(chrome_preflight))
         .route("/api/webhooks/media-upload", post(media_upload_webhook))
         .route("/webhook/media-upload", post(media_upload_webhook))
         .route("/cdn/*path", get(cdn_proxy))
@@ -329,6 +334,112 @@ async fn process_attachment(State(state): State<AppState>, Path(id): Path<i64>) 
 }
 
 #[derive(Deserialize)]
+struct ScanBody {
+    batch: Option<usize>,
+}
+
+async fn run_scan(State(state): State<AppState>, body: Option<Json<ScanBody>>) -> impl IntoResponse {
+    let Some(webhook) = state.webhook.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok": false, "error": "webhook processor not ready"}))).into_response();
+    };
+    let processor = webhook.clone();
+    let cfg = state.config.clone();
+    let task = state.current_task.clone();
+    let batch = body.and_then(|b| b.batch);
+    tokio::spawn(async move {
+        match crate::scan::scan_once(processor, cfg, task, batch).await {
+            Ok(n) => tracing::info!(target: "api_server", stage = "scan", count = n, "manual scan finished"),
+            Err(e) => tracing::warn!(target: "api_server", stage = "scan", "manual scan failed: {}", e),
+        }
+    });
+    (StatusCode::ACCEPTED, Json(serde_json::json!({"ok": true, "started": true}))).into_response()
+}
+
+async fn scan_status(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(db) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok": false, "error": "db not ready"}))).into_response();
+    };
+    let pending = db.count_pending_attachments().await.unwrap_or(0);
+    let total = db.count_attachments().await.unwrap_or(0);
+    let (queued, uploaded, finished, failed) = db.blogger_queue_counts().await.unwrap_or((0, 0, 0, 0));
+    let cfg = state.config_live.read().await;
+    let imgbb_ready = cfg.imgbb.enabled && !cfg.imgbb.api_key.trim().is_empty();
+    Json(serde_json::json!({
+        "ok": true,
+        "pending": pending,
+        "total": total,
+        "processed": (total - pending).max(0),
+        "scan_enabled": cfg.agent.scan_enabled,
+        "scan_interval_secs": cfg.agent.scan_interval_secs,
+        "scan_batch_size": cfg.agent.scan_batch_size,
+        "finish_workers": cfg.agent.finish_workers,
+        "delete_local_after_offload": cfg.agent.delete_local_after_offload,
+        "imgbb_ready": imgbb_ready,
+        "imgbb_upload_format": cfg.imgbb.upload_format,
+        "blogger_ready": !cfg.blogger.blog_id.trim().is_empty() && !cfg.blogger.blog_id.contains("YOUR_"),
+        "queue": {
+            "queued": queued,
+            "uploaded": uploaded,
+            "finished": finished,
+            "failed": failed
+        }
+    })).into_response()
+}
+
+async fn chrome_preflight(State(state): State<AppState>) -> impl IntoResponse {
+    let cfg = state.config_live.read().await;
+    let chrome = cfg.chrome.executable.clone()
+        .unwrap_or_else(|| crate::chrome::default_chrome_path().to_string_lossy().to_string());
+    let profile_dir = cfg.chrome.user_data_dir.clone()
+        .unwrap_or_else(|| crate::chrome::default_user_data_dir().to_string_lossy().to_string());
+    let port = cfg.chrome.remote_debugging_port;
+    let port_open = tokio::time::timeout(
+        std::time::Duration::from_millis(600),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    let chrome_exists = std::path::Path::new(&chrome).exists();
+    let profile_exists = std::path::Path::new(&profile_dir).exists();
+
+    let mut advice: Vec<String> = Vec::new();
+    if !chrome_exists {
+        advice.push(format!("Không tìm thấy Chrome tại {}", chrome));
+    }
+    if !profile_exists {
+        advice.push(format!("Chưa có profile Chrome tại {} (sẽ được tạo khi chạy)", profile_dir));
+    }
+    if !port_open {
+        advice.push(format!(
+            "Port {} chưa mở. Nếu Chrome đang chạy sẵn, hãy tắt hẳn (Cmd+Q) rồi để daemon tự mở, hoặc mở Chrome với --remote-debugging-port={}",
+            port, port
+        ));
+    }
+    if !cfg.blogger.blog_id.trim().is_empty() && !cfg.blogger.blog_id.contains("YOUR_") {
+        // ok
+    } else {
+        advice.push("Blogger Blog ID chưa hợp lệ (phải là ID thật, không phải placeholder)".into());
+    }
+    if advice.is_empty() {
+        advice.push("Chrome/profile/port/blog id đều sẵn sàng".into());
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "chrome_path": chrome,
+        "chrome_exists": chrome_exists,
+        "profile_dir": profile_dir,
+        "profile_exists": profile_exists,
+        "debug_port": port,
+        "port_open": port_open,
+        "headless": cfg.chrome.headless,
+        "blogger_id": cfg.blogger.blog_id,
+        "advice": advice
+    }))
+}
+
+#[derive(Deserialize)]
 struct LogsQuery {
     limit: Option<usize>,
     offset: Option<usize>,
@@ -454,6 +565,36 @@ async fn put_config(State(state): State<AppState>, Json(body): Json<serde_json::
         Some(v) => v,
         None => serde_json::json!({}),
     };
+    let mut body = body;
+    // keep server-side-only paths when the UI sends an empty value
+    if let Some(site) = body.get_mut("site").and_then(|v| v.as_object_mut()) {
+        let wp_path = site.get("wp_path").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        if wp_path.is_empty() {
+            let existing = current
+                .get("site")
+                .and_then(|i| i.get("wp_path"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            site.insert("wp_path".into(), serde_json::json!(existing));
+        }
+    }
+    if let Some(v) = body.get_mut("imgbb").and_then(|v| v.as_object_mut()) {
+        let incoming = v.get("api_key").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        if v.get("clear_api_key").and_then(|x| x.as_bool()).unwrap_or(false) {
+            v.insert("api_key".into(), serde_json::json!(""));
+            v.remove("clear_api_key");
+        } else if incoming.is_empty() {
+            let existing = current
+                .get("imgbb")
+                .and_then(|i| i.get("api_key"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            v.insert("api_key".into(), serde_json::json!(existing));
+        }
+        v.remove("clear_api_key");
+    }
     let merged = merge_json(current, body);
     // validate against Config schema
     match serde_json::from_value::<crate::config::Config>(merged.clone()) {
@@ -461,6 +602,7 @@ async fn put_config(State(state): State<AppState>, Json(body): Json<serde_json::
             if let Err(e) = cfg.validate() {
                 return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response();
             }
+            *state.config_live.write().await = cfg.clone();
             let pretty = serde_json::to_string_pretty(&merged).unwrap_or_else(|_| "{}".into());
             let tmp = format!("{}.tmp", path);
             if let Err(e) = std::fs::write(&tmp, pretty) {
@@ -495,41 +637,40 @@ fn merge_json(base: serde_json::Value, patch: serde_json::Value) -> serde_json::
 }
 
 async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
-    let cfg = &state.config;
-    Json(serde_json::json!({
-        "daemon": {
-            "port": cfg.agent.port,
-            "poll_interval_sec": cfg.agent.poll_interval_secs,
-            "replace_in_db": cfg.agent.replace_in_db,
-            "backup_before_replace": cfg.agent.backup_before_replace,
-            "enable_old_url_redirect_301": cfg.agent.enable_old_url_redirect_301,
-        },
-        "blogger": {
-            "blog_id": cfg.blogger.blog_id,
-            "upload_via": cfg.blogger.upload_via,
-            "one_wp_post_per_blogger_post": cfg.blogger.one_wp_post_per_blogger_post,
-        },
-        "chrome": {
-            "executable": cfg.chrome.executable,
-            "user_data_dir": cfg.chrome.user_data_dir,
-            "profile_directory": cfg.chrome.profile_directory,
-            "headless": cfg.chrome.headless,
-            "remote_debugging_port": cfg.chrome.remote_debugging_port,
-        },
-        "site": {
-            "url": cfg.site.url,
-            "uploads_dir": cfg.site.uploads_dir,
-        },
-        "imgbb": {
-            "enabled": cfg.imgbb.enabled,
-            "api_key_set": !cfg.imgbb.api_key.trim().is_empty(),
-            "upload_format": cfg.imgbb.upload_format,
-        },
-        "cdn": {
-            "host": cfg.cdn.host,
-            "scheme": cfg.cdn.scheme,
+    let cfg = state.config_live.read().await.clone();
+    let mut root = serde_json::to_value(&cfg).unwrap_or_else(|_| serde_json::json!({}));
+
+    if let Some(obj) = root.as_object_mut() {
+        // never expose DB password to the UI
+        if let Some(db) = obj.get_mut("database").and_then(|v| v.as_object_mut()) {
+            db.insert("password".into(), serde_json::json!(""));
+            db.insert("password_set".into(), serde_json::json!(!cfg.database.password.is_empty()));
         }
-    }))
+        if let Some(imgbb) = obj.get_mut("imgbb").and_then(|v| v.as_object_mut()) {
+            imgbb.insert("api_key_set".into(), serde_json::json!(!cfg.imgbb.api_key.trim().is_empty()));
+            imgbb.insert("api_key".into(), serde_json::json!(""));
+        }
+        // legacy alias kept for older UI components
+        let agent = obj.get("agent").cloned().unwrap_or_else(|| serde_json::json!({}));
+        obj.insert("_meta".into(), serde_json::json!({
+            "path": state.cfg_path.clone().unwrap_or_else(|| "(không xác định)".into()),
+            "source": "DAEMON_CONFIG",
+            "pid": std::process::id(),
+        }));
+        obj.insert("daemon".into(), serde_json::json!({
+            "host": agent.get("host").cloned().unwrap_or(serde_json::json!("0.0.0.0")),
+            "port": agent.get("port").cloned().unwrap_or(serde_json::json!(2095)),
+            "poll_interval_sec": agent.get("poll_interval_secs").cloned().unwrap_or(serde_json::json!(60)),
+            "replace_in_db": agent.get("replace_in_db").cloned().unwrap_or(serde_json::json!(true)),
+            "backup_before_replace": agent.get("backup_before_replace").cloned().unwrap_or(serde_json::json!(true)),
+            "enable_old_url_redirect_301": agent.get("enable_old_url_redirect_301").cloned().unwrap_or(serde_json::json!(true)),
+            "scan_enabled": agent.get("scan_enabled").cloned().unwrap_or(serde_json::json!(true)),
+            "scan_interval_secs": agent.get("scan_interval_secs").cloned().unwrap_or(serde_json::json!(900)),
+            "scan_batch_size": agent.get("scan_batch_size").cloned().unwrap_or(serde_json::json!(20)),
+            "delete_local_after_offload": agent.get("delete_local_after_offload").cloned().unwrap_or(serde_json::json!(true)),
+        }));
+    }
+    Json(root)
 }
 
 async fn get_current_task(State(state): State<AppState>) -> impl IntoResponse {
@@ -650,6 +791,18 @@ pub async fn run_server(config: Config, host_override: Option<String>, port_over
         let bg_cfg = cfg.clone();
         let bg_engine = engine.clone();
         tokio::spawn(async move { run_blogger_queue_worker(bg_wp, bg_cfg, bg_engine).await; });
+
+        // Crop/resize finish worker (parallel, independent from imgbb + blogger upload)
+        let fin_wp = wp.clone();
+        let fin_cfg = cfg.clone();
+        tokio::spawn(async move { crate::finish::run_finish_worker(fin_wp, fin_cfg).await; });
+
+        // Media library auto-scan worker (offload existing attachments)
+        let scan_wp = wp.clone();
+        let scan_cfg = cfg.clone();
+        let scan_task = current_task.clone();
+        tokio::spawn(async move { crate::scan::run_media_scan_worker(scan_wp, scan_cfg, scan_task).await; });
+
         Some(wp)
     } else { None };
 
@@ -660,7 +813,8 @@ pub async fn run_server(config: Config, host_override: Option<String>, port_over
     let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().unwrap_or_else(|_| reqwest::Client::new());
     let started_at = Instant::now();
     let cfg_path = std::env::var("DAEMON_CONFIG").ok();
-    let state = AppState { config: cfg, engine, db: db_shared, db_ok, current_task, webhook, http, started_at, cfg_path };
+    let config_live = Arc::new(RwLock::new((*cfg).clone()));
+    let state = AppState { config: cfg, engine, db: db_shared, db_ok, current_task, webhook, http, started_at, cfg_path, config_live };
     let app = create_router(state, dist_dir);
     let addr: SocketAddr = format!("{host}:{port}").parse().map_err(|e| Error::ConfigError(format!("invalid bind addr: {e}")))?;
     tracing::info!("wp-offload-daemon listening on http://{addr} (web-ui + API), chrome={}", default_chrome_path().display());

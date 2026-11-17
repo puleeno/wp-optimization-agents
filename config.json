@@ -1,49 +1,55 @@
 {
-  "database": {
-    "host": "localhost",
-    "port": 3306,
-    "user": "root",
-    "password": "root",
-    "name": "nghesachxua",
-    "table_prefix": "nsxu_"
-  },
-  "site": {
-    "url": "https://nghesachxua.localhost",
-    "uploads_dir": "/Users/puleeno/Projects/nghesachxua.com/wp-content/uploads"
+  "agent": {
+    "backup_before_replace": true,
+    "daemon_api_token": "8c39ec362bfa709fb4957163b73bb386639a967fe438bcbbc4ed5fc6c386f2d8",
+    "delete_local_after_offload": false,
+    "enable_old_url_redirect_301": true,
+    "finish_workers": 4,
+    "host": "127.0.0.1",
+    "poll_interval_secs": 60,
+    "port": 2095,
+    "replace_in_db": true,
+    "scan_batch_size": 20,
+    "scan_enabled": true,
+    "scan_interval_secs": 900
   },
   "blogger": {
-    "blog_id": "YOUR_BLOGGER_BLOG_ID_HERE",
-    "upload_via": "chrome_web_ui",
-    "one_wp_post_per_blogger_post": true
-  },
-  "chrome": {
-    "executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "user_data_dir": "/Users/puleeno/Library/Application Support/Google/Chrome",
-    "profile_directory": "Default",
-    "headless": false,
-    "remote_debugging_port": 9222,
-    "launch_timeout_secs": 30
-  },
-  "agent": {
-    "host": "127.0.0.1",
-    "port": 2095,
-    "poll_interval_secs": 60,
-    "replace_in_db": true,
-    "backup_before_replace": true,
-    "enable_old_url_redirect_301": true,
-    "daemon_api_token": "8c39ec362bfa709fb4957163b73bb386639a967fe438bcbbc4ed5fc6c386f2d8"
-  },
-  "imgbb": {
-    "api_key": "",
-    "enabled": true,
-    "upload_format": "url"
+    "blog_id": "ttt",
+    "one_wp_post_per_blogger_post": true,
+    "upload_via": "chrome_web_ui"
   },
   "cdn": {
-    "host": "cdn.nghesachxua.localhost",
+    "host": "${CDN_HOST:-cdn.nghesachxua.localhost}",
     "scheme": "https"
   },
+  "chrome": {
+    "executable": "",
+    "headless": false,
+    "launch_timeout_secs": 30,
+    "profile_directory": "Default",
+    "remote_debugging_port": 9222,
+    "user_data_dir": ""
+  },
+  "database": {
+    "host": "${DB_HOST:-127.0.0.1}",
+    "name": "${DB_NAME:-nghesachxua}",
+    "password": "${DB_PASSWORD:-root}",
+    "port": 3306,
+    "table_prefix": "nsxu_",
+    "user": "${DB_USER:-root}"
+  },
+  "imgbb": {
+    "api_key": "b7277d0b385fb6369278d01430179daa",
+    "enabled": true,
+    "upload_format": "blob"
+  },
   "logging": {
-    "level": "info",
-    "json": false
+    "json": false,
+    "level": "info"
+  },
+  "site": {
+    "uploads_dir": "${WP_UPLOADS_DIR:-../wp-content/uploads}",
+    "url": "${SITE_URL:-https://nghesachxua.localhost}",
+    "wp_path": "${WP_PATH:-../..}"
   }
 }

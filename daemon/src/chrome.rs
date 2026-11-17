@@ -319,14 +319,91 @@ async fn wait_for_ws_url(port_file: &Path, port: u16, timeout_secs: u64) -> Resu
 pub fn default_chrome_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        let p = PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-        if p.exists() { return p; }
+        for p in [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ] {
+            let path = PathBuf::from(p);
+            if path.exists() {
+                return path;
+            }
+        }
     }
     #[cfg(target_os = "linux")]
     {
-        for c in ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"] {
-            let p = PathBuf::from(c); if p.exists() { return p; }
+        for c in [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+            "/usr/bin/microsoft-edge",
+        ] {
+            let path = PathBuf::from(c);
+            if path.exists() {
+                return path;
+            }
         }
     }
-    PathBuf::from("google-chrome")
+    #[cfg(target_os = "windows")]
+    {
+        for p in [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ] {
+            let path = PathBuf::from(p);
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+    // last resort: rely on PATH lookup by the OS
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from("chrome.exe")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from("google-chrome")
+    }
+}
+
+/// OS-specific default Chrome profile directory (Linux: ~/.config/..., macOS: ~/Library/..., Windows: %LOCALAPPDATA%).
+pub fn default_user_data_dir() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from(home).join("Library/Application Support/Google/Chrome")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| format!("{}/AppData/Local", home));
+        PathBuf::from(local).join("Google/Chrome/User Data")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        PathBuf::from(home).join(".config/google-chrome")
+    }
+}
+
+/// Per-daemon automation profile (used when the shared Chrome profile is busy/locked).
+pub fn default_automation_profile() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from(home).join("Library/Application Support/wp-opt-agents-chrome")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| format!("{}/AppData/Local", home));
+        PathBuf::from(local).join("wp-opt-agents-chrome")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        PathBuf::from(home).join(".config/wp-opt-agents-chrome")
+    }
 }

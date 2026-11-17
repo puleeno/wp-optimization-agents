@@ -144,12 +144,16 @@ impl WebhookProcessor {
         }
 
         let mut deleted = 0usize;
-        for sz in &all_sizes {
-            if let Some(local_path) = sz.path.clone().or_else(|| self.url_to_local(&sz.url)) {
-                if std::path::Path::new(&local_path).exists() && std::fs::remove_file(&local_path).is_ok() {
-                    deleted += 1;
+        if self.cfg.agent.delete_local_after_offload {
+            for sz in &all_sizes {
+                if let Some(local_path) = sz.path.clone().or_else(|| self.url_to_local(&sz.url)) {
+                    if std::path::Path::new(&local_path).exists() && std::fs::remove_file(&local_path).is_ok() {
+                        deleted += 1;
+                    }
                 }
             }
+        } else if !all_sizes.is_empty() {
+            info!(target: "webhook", stage = "cleanup", provider = "wp_fs", attachment_id = payload.attachment_id, "delete_local_after_offload=false - local files kept");
         }
 
         info!(target: "webhook", stage = "done", provider = "imgbb", attachment_id = payload.attachment_id, queued = replacements.len(), replaced_posts = replaced_posts, deleted_files = deleted, "media upload processed");
@@ -226,17 +230,35 @@ pub async fn run_blogger_queue_worker(
                 .executable
                 .clone()
                 .unwrap_or_else(|| default_chrome_path().to_string_lossy().to_string());
-            let user_data = cfg.chrome.user_data_dir.clone().unwrap_or_else(|| {
-                std::env::var("HOME")
-                    .map(|h| format!("{}/.config/wp-opt-agents-chrome", h))
-                    .unwrap_or_else(|_| ".wp-opt-agents-chrome".into())
-            });
+            let user_data = cfg.chrome.user_data_dir.clone()
+                .unwrap_or_else(|| crate::chrome::default_user_data_dir().to_string_lossy().to_string());
             let profile = if cfg.chrome.profile_directory.is_empty() { "Default".to_string() } else { cfg.chrome.profile_directory.clone() };
-            let cdp = match Cdp::launch_and_connect(&chrome, &PathBuf::from(&user_data), &profile, cfg.chrome.headless, cfg.chrome.remote_debugging_port, cfg.chrome.launch_timeout_secs).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(target: "webhook", stage = "blogger_job", provider = "chrome_cdp", attachment_id = attachment_id, size = %image_size, "chrome launch failed: {}", e);
-                    let _ = processor.db.mark_blogger_job_status(job_id, "failed", None, Some(&e.to_string())).await;
+            let mut cdp_opt = None;
+            let mut last_err = String::new();
+            for attempt in 1..=2 {
+                match Cdp::launch_and_connect(&chrome, &PathBuf::from(&user_data), &profile, cfg.chrome.headless, cfg.chrome.remote_debugging_port, cfg.chrome.launch_timeout_secs).await {
+                    Ok(c) => {
+                        cdp_opt = Some(c);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        if attempt == 1 {
+                            warn!(target: "webhook", stage = "blogger_job", provider = "chrome_cdp", attachment_id = attachment_id, size = %image_size, "chrome launch attempt 1 failed ({}) - retrying", e);
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        }
+                    }
+                }
+            }
+            let cdp = match cdp_opt {
+                Some(c) => c,
+                None => {
+                    let hint = format!(
+                        "{} | profile={} port={} (neu Chrome dang mo san: hay tat han Cmd+Q roi thu lai, hoac mo Chrome voi --remote-debugging-port={})",
+                        last_err, user_data, cfg.chrome.remote_debugging_port, cfg.chrome.remote_debugging_port
+                    );
+                    warn!(target: "webhook", stage = "blogger_job", provider = "chrome_cdp", attachment_id = attachment_id, size = %image_size, "{}", hint);
+                    let _ = processor.db.mark_blogger_job_status(job_id, "failed", None, Some(&hint)).await;
                     let _ = tokio::fs::remove_file(&tmp_path).await;
                     continue;
                 }
@@ -254,8 +276,9 @@ pub async fn run_blogger_queue_worker(
                         let blogger_url = up.blogger_url.clone();
                         let _ = processor.db.insert_url_version(attachment_id, &image_size, "blogger", &source_url, &blogger_url).await;
                         let _ = processor.db.set_cdn_target_latest_blogger(attachment_id, &image_size, &blogger_url).await;
-                        let _ = processor.db.mark_blogger_job_status(job_id, "done", Some(&blogger_url), None).await;
-                        info!(target: "webhook", stage = "blogger_job", provider = "blogger", attachment_id = attachment_id, size = %image_size, target = %blogger_url, "blogger upload done; CDN switched to blogger");
+                        // Hand off to the finish worker (crop/resize) instead of marking done here.
+                        let _ = processor.db.mark_blogger_job_status(job_id, "uploaded", Some(&blogger_url), None).await;
+                        info!(target: "webhook", stage = "blogger_job", provider = "blogger", attachment_id = attachment_id, size = %image_size, target = %blogger_url, "blogger upload done; queued for crop/resize finish");
                     } else {
                         warn!(target: "webhook", stage = "blogger_job", provider = "blogger", attachment_id = attachment_id, size = %image_size, "blogger upload returned no result");
                         let _ = processor.db.mark_blogger_job_status(job_id, "failed", None, Some("no upload result")).await;

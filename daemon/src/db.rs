@@ -849,6 +849,69 @@ impl Db {
         Ok(row.map(|r| r.0).unwrap_or(0))
     }
 
+    /// Attachment ids that still need offload: no successful mapping yet, or has failures.
+    pub async fn list_pending_attachments(&self, limit: usize) -> Result<Vec<i64>> {
+        let mut conn = self.pool.get_conn().await?;
+        let rows: Vec<(i64,)> = conn.exec(
+            format!(
+                "SELECT p.ID FROM {} p \
+                 LEFT JOIN {} i ON i.attachment_id = p.ID \
+                 WHERE p.post_type='attachment' AND (p.post_mime_type LIKE 'image/%' OR p.post_mime_type = '') \
+                 GROUP BY p.ID \
+                 HAVING COALESCE(SUM(CASE WHEN i.status IN ('replaced','uploaded') THEN 1 ELSE 0 END),0) = 0 \
+                    OR COALESCE(SUM(CASE WHEN i.status='failed' THEN 1 ELSE 0 END),0) > 0 \
+                 ORDER BY p.ID DESC LIMIT {}",
+                self.posts_table(), self.images_table(), limit.clamp(1, 500)
+            ),
+            (),
+        ).await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    pub async fn blogger_queue_counts(&self) -> Result<(i64, i64, i64, i64)> {
+        let mut conn = self.pool.get_conn().await?;
+        let row: Option<Row> = conn
+            .exec_first(
+                format!(
+                    "SELECT                        CAST(COALESCE(SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END),0) AS SIGNED) AS queued, \
+                       CAST(COALESCE(SUM(CASE WHEN status='uploaded' THEN 1 ELSE 0 END),0) AS SIGNED) AS uploaded, \
+                       CAST(COALESCE(SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END),0) AS SIGNED) AS finished, \
+                       CAST(COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0) AS SIGNED) AS failed \
+                     FROM {}",
+                    self.blogger_queue_table()
+                ),
+                (),
+            )
+            .await?;
+        Ok(row
+            .map(|r| {
+                (
+                    r.get::<Option<i64>, _>("queued").unwrap_or(None).unwrap_or(0),
+                    r.get::<Option<i64>, _>("uploaded").unwrap_or(None).unwrap_or(0),
+                    r.get::<Option<i64>, _>("finished").unwrap_or(None).unwrap_or(0),
+                    r.get::<Option<i64>, _>("failed").unwrap_or(None).unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0, 0, 0)))
+    }
+
+    pub async fn count_pending_attachments(&self) -> Result<i64> {
+        let mut conn = self.pool.get_conn().await?;
+        let row: Option<(i64,)> = conn.exec_first(
+            format!(
+                "SELECT COUNT(*) FROM (SELECT p.ID FROM {} p \
+                 LEFT JOIN {} i ON i.attachment_id = p.ID \
+                 WHERE p.post_type='attachment' AND (p.post_mime_type LIKE 'image/%' OR p.post_mime_type = '') \
+                 GROUP BY p.ID \
+                 HAVING COALESCE(SUM(CASE WHEN i.status IN ('replaced','uploaded') THEN 1 ELSE 0 END),0) = 0 \
+                    OR COALESCE(SUM(CASE WHEN i.status='failed' THEN 1 ELSE 0 END),0) > 0) t",
+                self.posts_table(), self.images_table()
+            ),
+            (),
+        ).await?;
+        Ok(row.map(|r| r.0).unwrap_or(0))
+    }
+
     pub async fn list_attachments_with_offload(&self, limit: usize, offset: usize) -> Result<Vec<serde_json::Value>> {
         let mut conn = self.pool.get_conn().await?;
         let uploads_base = format!("{}/", self.cfg.site.url.trim_end_matches('/'));
@@ -940,6 +1003,69 @@ impl Db {
             if let Some((t,)) = row { if !t.is_empty() { types.insert(t); } }
         }
         Ok(types.into_iter().collect())
+    }
+
+    /// Jobs whose Blogger upload finished and now need crop/resize finalisation.
+    pub async fn get_uploaded_blogger_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(i64, i64, Option<i64>, String, String)>> {
+        let mut conn = self.pool.get_conn().await?;
+        let rows: Vec<Row> = conn
+            .exec(
+                format!(
+                    "SELECT id, attachment_id, post_id, image_size, blogger_url FROM {} WHERE status='uploaded' AND blogger_url IS NOT NULL ORDER BY id ASC LIMIT {}",
+                    self.blogger_queue_table(),
+                    limit.clamp(1, 64)
+                ),
+                (),
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<i64, _>("id").unwrap_or(0),
+                    r.get::<i64, _>("attachment_id").unwrap_or(0),
+                    r.get::<Option<i64>, _>("post_id").unwrap_or(None),
+                    row_opt_string(&r, "image_size").unwrap_or_default(),
+                    row_opt_string(&r, "blogger_url").unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// width/height/crop of a registered WP image size, from `_wp_attachment_metadata`.
+    pub async fn get_size_spec(&self, attachment_id: i64, size: &str) -> Result<Option<(u32, u32, bool)>> {
+        let mut conn = self.pool.get_conn().await?;
+        let row: Option<Row> = conn
+            .exec_first(
+                format!(
+                    "SELECT meta_value FROM {} WHERE post_id=:p AND meta_key='_wp_attachment_metadata' LIMIT 1",
+                    self.postmeta_table()
+                ),
+                params! {"p" => attachment_id},
+            )
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        let Some(raw) = row_opt_string(&row, "meta_value") else { return Ok(None) };
+        let meta = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => v,
+            Err(_) => match crate::php::parse(&raw) {
+                Some(v) => v,
+                None => return Ok(None),
+            },
+        };
+        if size == "full" {
+            let w = meta.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let h = meta.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            return Ok(Some((w, h, false)));
+        }
+        let Some(sz) = meta.get("sizes").and_then(|s| s.get(size)) else { return Ok(None) };
+        let w = sz.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let h = sz.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let crop = sz.get("crop").and_then(|v| v.as_bool()).unwrap_or(false);
+        Ok(Some((w, h, crop)))
     }
 
     pub async fn get_attachment_payload(&self, attachment_id: i64) -> Result<Option<crate::webhook::MediaUploadPayload>> {

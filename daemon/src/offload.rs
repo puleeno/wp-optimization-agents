@@ -207,7 +207,7 @@ impl OffloadEngine {
     async fn launch_chrome(&self) -> Result<Cdp> {
         let chrome = self.cfg.chrome.executable.clone().unwrap_or_else(|| default_chrome_path().to_string_lossy().to_string());
         let user_data = self.cfg.chrome.user_data_dir.clone()
-            .unwrap_or_else(|| dirs_next_fallback().join("wp-opt-agents-chrome").to_string_lossy().to_string());
+            .unwrap_or_else(|| default_user_data_dir().to_string_lossy().to_string());
         let profile = if self.cfg.chrome.profile_directory.is_empty() { "Default".to_string() } else { self.cfg.chrome.profile_directory.clone() };
         Cdp::launch_and_connect(&chrome, &PathBuf::from(user_data), &profile, self.cfg.chrome.headless, self.cfg.chrome.remote_debugging_port, self.cfg.chrome.launch_timeout_secs).await
     }
@@ -250,6 +250,6 @@ impl OffloadEngine {
     }
 }
 
-fn dirs_next_fallback() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") { PathBuf::from(home).join(".config") } else { PathBuf::from(".") }
+fn default_user_data_dir() -> PathBuf {
+    crate::chrome::default_user_data_dir()
 }

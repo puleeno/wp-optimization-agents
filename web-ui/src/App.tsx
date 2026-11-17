@@ -353,10 +353,9 @@ export default function App() {
     }
   };
 
-  const handleSaveConfig = async (newConfig: AgentConfig) => {
-    setConfig(newConfig);
-    // In real implementation, POST to /api/config
-    // config save is client-side for now; daemon /api/config is read-only
+  const handleSaveConfig = async (newConfig: any) => {
+    // ConfigTab already persisted via PUT /api/config; just sync local state.
+    setConfig((prev: any) => ({ ...(prev || {}), ...(newConfig || {}) }));
   };
 
   if (loading && !daemonMetrics) {

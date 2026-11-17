@@ -165,7 +165,7 @@ export const DaemonEngineTab: React.FC<DaemonEngineTabProps> = ({ metrics, confi
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={loadLogs}
+              onClick={() => loadLogs()}
               className="px-3.5 py-2 text-xs font-semibold rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-slate-700 transition-all flex items-center gap-1.5"
             >
               <RotateCw className="w-3.5 h-3.5" />
@@ -374,6 +374,7 @@ export const DaemonEngineTab: React.FC<DaemonEngineTabProps> = ({ metrics, confi
             </label>
             <span>{logs.length} dòng · tổng {totalLogs.toLocaleString()} trong DB</span>
             {logPage > 0 && <span>trang {logPage + 1}</span>}
+            <span className="hidden lg:inline">config: <span className="font-mono">{(config as any)?._meta?.path || '—'}</span></span>
           </div>
           <div className="flex items-center gap-1.5">
             <button

@@ -42,6 +42,7 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
   const [page, setPage] = useState(0);
   const [total, setTotal] = useState(0);
   const [pageSize, setPageSize] = useState(200);
+  const [scanInfo, setScanInfo] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'processing' | 'done' | 'failed'>('all');
@@ -62,6 +63,8 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
       setItems(arr);
       if (totalCount > 0) setTotal(totalCount);
       setPage(p);
+      const s = await fetch('/api/scan/status').then((r) => r.json()).catch(() => null);
+      if (s) setScanInfo(s);
     } catch (e: any) {
       setError(e?.message || 'Không tải được danh sách media');
     } finally {
@@ -164,6 +167,19 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
             <option value={500}>500/trang</option>
             <option value={1000}>1000/trang</option>
           </select>
+          <button
+            onClick={async () => {
+              try {
+                await fetch('/api/scan/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+              } catch {}
+              await load(page);
+            }}
+            disabled={batchRunning}
+            title="Yêu cầu daemon quét & offload ngay batch media chưa xử lý"
+            className="px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-300 border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 hover:bg-amber-100 rounded-lg disabled:opacity-50"
+          >
+            Quét ngay
+          </button>
           <button onClick={() => load(page)} className="px-3 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800">Tải lại</button>
           <button
             onClick={processBatch}
@@ -177,7 +193,15 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs">
-        <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Tổng media</div><div className="text-lg font-bold">{counts.total}</div></div>
+        <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div className="text-slate-400">Tổng media</div>
+          <div className="text-lg font-bold">{counts.total}</div>
+          <div className="text-[10px] text-slate-400 mt-0.5">
+            {scanInfo
+              ? `chờ xử lý: ${Number(scanInfo.pending ?? 0).toLocaleString()} · đã xử lý: ${Number(scanInfo.processed ?? 0).toLocaleString()}`
+              : 'chưa có dữ liệu hàng đợi'}
+          </div>
+        </div>
         <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Chờ xử lý</div><div className="text-lg font-bold text-amber-600">{counts.pending}</div></div>
         <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Đang/đã backup</div><div className="text-lg font-bold text-sky-600">{counts.processing}</div></div>
         <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Hoàn tất</div><div className="text-lg font-bold text-emerald-600">{counts.done}</div></div>
@@ -201,6 +225,25 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
           ))}
         </div>
       </div>
+
+      {scanInfo && (!scanInfo.imgbb_ready || !scanInfo.blogger_ready || !scanInfo.scan_enabled) && (
+        <div className="p-3 rounded-lg text-xs border bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-300 space-y-1">
+          <div className="font-semibold">Worker chưa thể chạy — thiếu cấu hình:</div>
+          <ul className="list-disc list-inside space-y-0.5">
+            {!scanInfo.imgbb_ready && <li>imgbb API key chưa cấu hình (vào <b>/config</b> → imgbb backup → nhập API key).</li>}
+            {!scanInfo.blogger_ready && <li>Blogger Blog ID chưa cấu hình (vào <b>/config</b> → Blogger → Blog ID).</li>}
+            {!scanInfo.scan_enabled && <li>Tự động quét đang tắt (<b>/config</b> → Daemon runtime → bật “Tự động quét”).</li>}
+          </ul>
+          <div className="text-[11px] opacity-80">
+            {scanInfo.delete_local_after_offload !== false && (
+              <li className="text-rose-600 dark:text-rose-400">
+                Đang bật <b>Xoá file gốc sau khi offload</b> — có thể tắt ở <b>/config</b> → Daemon runtime nếu muốn giữ file gốc.
+              </li>
+            )}
+            Hàng đợi Blogger: {scanInfo.queue?.queued ?? 0} chờ · {scanInfo.queue?.uploaded ?? 0} chờ crop/resize · {scanInfo.queue?.finished ?? 0} xong · {scanInfo.queue?.failed ?? 0} lỗi · chu kỳ {scanInfo.scan_interval_secs}s · batch {scanInfo.scan_batch_size}/lượt · {scanInfo.finish_workers} luồng finish.
+          </div>
+        </div>
+      )}
 
       <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
         {error && <div className="p-4 text-sm text-rose-600 border-b border-slate-200 dark:border-slate-800">{error}</div>}

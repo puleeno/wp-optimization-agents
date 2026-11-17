@@ -60,6 +60,49 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({ config, onSaveConfig }) =>
     }
   };
 
+  // Only send sections the daemon config schema owns; never send DB creds / legacy aliases.
+  const payloadOf = (src: any) => ({
+    site: {
+      url: src?.site?.url ?? '',
+      wp_path: src?.site?.wp_path ?? '',
+      uploads_dir: src?.site?.uploads_dir ?? '',
+    },
+    agent: {
+      host: src?.agent?.host ?? '0.0.0.0',
+      port: Number(src?.agent?.port ?? 2095),
+      poll_interval_secs: Number(src?.agent?.poll_interval_secs ?? 60),
+      replace_in_db: src?.agent?.replace_in_db !== false,
+      backup_before_replace: src?.agent?.backup_before_replace !== false,
+      enable_old_url_redirect_301: src?.agent?.enable_old_url_redirect_301 !== false,
+      daemon_api_token: src?.agent?.daemon_api_token ?? '',
+      scan_enabled: src?.agent?.scan_enabled !== false,
+      scan_interval_secs: Number(src?.agent?.scan_interval_secs ?? 900),
+      scan_batch_size: Number(src?.agent?.scan_batch_size ?? 20),
+      delete_local_after_offload: src?.agent?.delete_local_after_offload !== false,
+      finish_workers: Number(src?.agent?.finish_workers ?? 4),
+    },
+    cdn: { host: src?.cdn?.host ?? '', scheme: src?.cdn?.scheme || 'https' },
+    imgbb: {
+      enabled: src?.imgbb?.enabled !== false,
+      api_key: src?.imgbb?.api_key ?? '',
+      upload_format: src?.imgbb?.upload_format || 'url',
+    },
+    chrome: {
+      executable: src?.chrome?.executable || null,
+      user_data_dir: src?.chrome?.user_data_dir || null,
+      profile_directory: src?.chrome?.profile_directory || 'Default',
+      headless: src?.chrome?.headless === true,
+      remote_debugging_port: Number(src?.chrome?.remote_debugging_port ?? 9222),
+      launch_timeout_secs: Number(src?.chrome?.launch_timeout_secs ?? 30),
+    },
+    blogger: {
+      blog_id: src?.blogger?.blog_id ?? '',
+      upload_via: src?.blogger?.upload_via || 'chrome_web_ui',
+      one_wp_post_per_blogger_post: src?.blogger?.one_wp_post_per_blogger_post !== false,
+    },
+    logging: { level: src?.logging?.level || 'info' },
+  });
+
   const save = async (payload: any) => {
     setBusy(true);
     setMsg(null);
@@ -87,7 +130,7 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({ config, onSaveConfig }) =>
   const saveJson = () => {
     try {
       const parsed = JSON.parse(jsonText);
-      save(parsed);
+      save(payloadOf(parsed));
     } catch {
       setMsg({ type: 'err', text: 'JSON không hợp lệ.' });
     }
@@ -101,6 +144,28 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({ config, onSaveConfig }) =>
     a.download = 'config.json';
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const [preflight, setPreflight] = useState<any>(null);
+
+  const runPreflight = async () => {
+    try {
+      const res = await fetch('/api/chrome/preflight');
+      setPreflight(await res.json());
+    } catch {
+      setPreflight({ ok: false, advice: ['Không gọi được /api/chrome/preflight'] });
+    }
+  };
+
+  const copyPath = async () => {
+    const path = form?._meta?.path || '';
+    if (!path) return;
+    try {
+      await navigator.clipboard.writeText(path);
+      setMsg({ type: 'ok', text: `Đã copy đường dẫn: ${path}` });
+    } catch {
+      setMsg({ type: 'err', text: `Không copy được. Đường dẫn: ${path}` });
+    }
   };
 
   const inputCls =
@@ -157,12 +222,30 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({ config, onSaveConfig }) =>
             <RotateCcw className={`w-4 h-4 ${busy ? 'animate-spin' : ''}`} />
           </button>
           <button
-            onClick={() => (tab === 'form' ? save(form) : saveJson())}
+            onClick={() => (tab === 'form' ? save(payloadOf(form)) : saveJson())}
             disabled={busy}
             className="px-4 py-2 text-xs font-semibold text-white bg-orange-600 hover:bg-orange-500 disabled:opacity-50 rounded-lg flex items-center gap-1.5 whitespace-nowrap"
           >
             <Save className="w-4 h-4" />
             <span>{busy ? 'Đang lưu...' : 'Lưu cấu hình'}</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+        <div className="min-w-0">
+          <div className="text-slate-500 dark:text-slate-400">File cấu hình daemon đang dùng:</div>
+          <div className="font-mono text-[11px] text-slate-900 dark:text-slate-100 break-all">
+            {form?._meta?.path || '(không xác định — đặt biến môi trường DAEMON_CONFIG)'}
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="text-[10px] text-slate-400">PID {form?._meta?.pid ?? '—'}</span>
+          <button
+            onClick={copyPath}
+            className="px-2.5 py-1 rounded border border-slate-200 dark:border-slate-700 hover:bg-white dark:hover:bg-slate-900 text-slate-600 dark:text-slate-300"
+          >
+            Copy path
           </button>
         </div>
       </div>
@@ -228,7 +311,7 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({ config, onSaveConfig }) =>
                   placeholder="/Users/puleeno/Projects/nghesachxua.com/wp-content/uploads"
                 />
                 <span className="text-[10px] text-slate-400 mt-0.5 block">
-                  Dùng để tìm file vật lý khi upload imgbb dạng blob và xoá file sau khi thay URL.
+                  Hỗ trợ <code className="font-mono">${'{'}VAR{'}'}</code> / <code className="font-mono">${'{'}VAR:-default{'}'}</code> và đường dẫn tương đối (quy chiếu thư mục chứa config). Dùng để tìm file vật lý khi upload imgbb dạng blob.
                 </span>
               </div>
               <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/40 border border-slate-100 dark:border-slate-800">
@@ -262,6 +345,51 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({ config, onSaveConfig }) =>
                   <input type="number" className={inputCls} value={form.agent?.port ?? 2095} onChange={(e) => set((d) => { d.agent = { ...(d.agent || {}), port: Number(e.target.value) }; })} />
                 </div>
               </div>
+              <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-2">
+                <label className="flex items-center justify-between cursor-pointer gap-3">
+                  <span className="text-slate-700 dark:text-slate-300">
+                    Xoá file gốc trong wp-content/uploads sau khi offload thành công
+                  </span>
+                  <input
+                    type="checkbox"
+                    className="w-4 h-4 accent-orange-600 rounded"
+                    checked={form.agent?.delete_local_after_offload !== false}
+                    onChange={(e) => set((d) => { d.agent = { ...(d.agent || {}), delete_local_after_offload: e.target.checked }; })}
+                  />
+                </label>
+                <label className="flex items-center justify-between cursor-pointer gap-3">
+                  <span className="text-slate-700 dark:text-slate-300">
+                    Tự động quét &amp; offload media mới/chưa xử lý
+                  </span>
+                  <input
+                    type="checkbox"
+                    className="w-4 h-4 accent-orange-600 rounded"
+                    checked={form.agent?.scan_enabled !== false}
+                    onChange={(e) => set((d) => { d.agent = { ...(d.agent || {}), scan_enabled: e.target.checked }; })}
+                  />
+                </label>
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className={labelCls}>Chu kỳ quét (giây)</label>
+                    <input type="number" className={inputCls} value={form.agent?.scan_interval_secs ?? 900} onChange={(e) => set((d) => { d.agent = { ...(d.agent || {}), scan_interval_secs: Number(e.target.value) }; })} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>Số media mỗi lượt</label>
+                    <input type="number" className={inputCls} value={form.agent?.scan_batch_size ?? 20} onChange={(e) => set((d) => { d.agent = { ...(d.agent || {}), scan_batch_size: Number(e.target.value) }; })} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>Luồng finish song song</label>
+                    <input type="number" className={inputCls} value={form.agent?.finish_workers ?? 4} onChange={(e) => set((d) => { d.agent = { ...(d.agent || {}), finish_workers: Number(e.target.value) }; })} />
+                  </div>
+                </div>
+                <span className="text-[10px] text-slate-400 block">
+                  Luồng <b>finish</b> chạy độc lập với luồng upload imgbb và luồng upload Blogger: lấy URL Blogger đã upload, crop/resize theo từng image size rồi cập nhật CDN sang phiên bản mới nhất của <code className="font-mono">attachment_id + image_size</code>.
+                </span>
+                <span className="text-[10px] text-slate-400 block">
+                  Worker chạy nền: quét <code className="font-mono">wp_posts.post_type=attachment</code> chưa có mapping CDN/Blogger, sau đó upload imgbb → thay URL content → queue Blogger.
+                </span>
+              </div>
+
               <div>
                 <label className={labelCls}>Chu kỳ poll queue Blogger (giây)</label>
                 <input type="number" className={inputCls} value={form.agent?.poll_interval_secs ?? 60} onChange={(e) => set((d) => { d.agent = { ...(d.agent || {}), poll_interval_secs: Number(e.target.value) }; })} />
@@ -363,10 +491,10 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({ config, onSaveConfig }) =>
                   className={inputCls}
                   value={form.imgbb?.api_key || ''}
                   onChange={(e) => set((d) => { d.imgbb = { ...(d.imgbb || {}), api_key: e.target.value }; })}
-                  placeholder="(bắt buộc để chạy pipeline)"
+                  placeholder={form.imgbb?.api_key_set ? '•••••• (đã lưu — để trống nếu không đổi)' : '(bắt buộc để chạy pipeline)'}
                 />
-                <span className={`text-[10px] mt-0.5 block ${form.imgbb?.api_key ? 'text-emerald-600' : 'text-amber-600'}`}>
-                  {form.imgbb?.api_key ? 'Đã cấu hình' : 'Chưa có key — webhook sẽ lỗi khi xử lý media'}
+                <span className={`text-[10px] mt-0.5 block ${form.imgbb?.api_key || form.imgbb?.api_key_set ? 'text-emerald-600' : 'text-amber-600'}`}>
+                  {form.imgbb?.api_key || form.imgbb?.api_key_set ? 'Đã cấu hình' : 'Chưa có key — webhook/scan sẽ lỗi khi xử lý media'}
                 </span>
               </div>
               <div>
@@ -413,8 +541,24 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({ config, onSaveConfig }) =>
                 <label className={labelCls}>user_data_dir (profile Chrome đã đăng nhập Blogger)</label>
                 <input className={inputCls} value={form.chrome?.user_data_dir || ''} onChange={(e) => set((d) => { d.chrome = { ...(d.chrome || {}), user_data_dir: e.target.value }; })} />
               </div>
+              <button
+                onClick={runPreflight}
+                className="w-full px-3 py-2 rounded-lg text-xs font-semibold text-white bg-slate-800 hover:bg-slate-700 dark:bg-slate-700 dark:hover:bg-slate-600"
+              >
+                Kiểm tra Chrome / profile / port debug
+              </button>
+              {preflight && (
+                <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/40 border border-slate-100 dark:border-slate-800 space-y-0.5 text-[11px] font-mono break-all">
+                  <div>chrome: {preflight.chrome_path} {preflight.chrome_exists ? '✅' : '❌'}</div>
+                  <div>profile: {preflight.profile_dir} {preflight.profile_exists ? '✅' : '⚠️'}</div>
+                  <div>port {preflight.debug_port}: {preflight.port_open ? '✅ open' : '❌ closed'} · headless: {String(preflight.headless)}</div>
+                  {(preflight.advice || []).map((a: string, i: number) => (
+                    <div key={i} className="text-amber-600 dark:text-amber-400">{a}</div>
+                  ))}
+                </div>
+              )}
               <div>
-                <label className={labelCls}>Đường dẫn Chrome executable</label>
+                <label className={labelCls}>Đường dẫn Chrome executable (để trống = tự dò theo OS)</label>
                 <input className={inputCls} value={form.chrome?.executable || ''} onChange={(e) => set((d) => { d.chrome = { ...(d.chrome || {}), executable: e.target.value }; })} placeholder="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" />
               </div>
             </div>

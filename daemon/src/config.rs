@@ -15,6 +15,9 @@ pub struct Config {
     pub cdn: CdnConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Directory of the config file (used to resolve relative paths); not serialized.
+    #[serde(skip)]
+    pub base_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -77,6 +80,19 @@ pub struct AgentConfig {
     pub backup_before_replace: bool,
     #[serde(default)]
     pub daemon_api_token: String,
+    /// Automatic media-library scan worker (offload existing attachments)
+    #[serde(default = "default_true")]
+    pub scan_enabled: bool,
+    #[serde(default = "default_scan_interval")]
+    pub scan_interval_secs: u64,
+    #[serde(default = "default_scan_batch")]
+    pub scan_batch_size: u64,
+    /// Parallel crop/resize finish workers (independent from imgbb + blogger upload)
+    #[serde(default = "default_finish_workers")]
+    pub finish_workers: u64,
+    /// Delete local physical files after a successful offload (imgbb + CDN + Blogger queue)
+    #[serde(default = "default_true")]
+    pub delete_local_after_offload: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -120,6 +136,36 @@ impl Default for CdnConfig {
     }
 }
 
+/// Expand `${VAR}` and `${VAR:-default}` placeholders using environment variables.
+pub fn expand_env(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(close_rel) = input[i + 2..].find('}') {
+                let close = i + 2 + close_rel;
+                let inner = &input[i + 2..close];
+                let (name, default) = match inner.split_once(":-") {
+                    Some((n, d)) => (n.trim(), Some(d)),
+                    None => (inner.trim(), None),
+                };
+                let value = std::env::var(name)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| default.map(|d| d.to_string()))
+                    .unwrap_or_default();
+                out.push_str(&value);
+                i = close + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 fn default_upload_via() -> String { "chrome_web_ui".into() }
 fn default_profile_dir() -> String { "Default".into() }
 fn default_debug_port() -> u16 { 9222 }
@@ -132,6 +178,9 @@ fn default_log_level() -> String { "info".into() }
 fn default_cdn_scheme() -> String { "https".into() }
 fn default_cdn_host() -> String { "cdn.nghesachxua.localhost".into() }
 fn default_imgbb_upload_format() -> String { "url".into() }
+fn default_scan_interval() -> u64 { 900 }
+fn default_scan_batch() -> u64 { 20 }
+fn default_finish_workers() -> u64 { 4 }
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
@@ -139,6 +188,10 @@ impl Config {
             .map_err(|e| Error::ConfigError(format!("Failed to read config {}: {}", path, e)))?;
         let mut cfg: Config = serde_json::from_str(&content)
             .map_err(|e| Error::ConfigError(format!("Failed to parse config {}: {}", path, e)))?;
+        cfg.base_dir = Path::new(path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .or_else(|| Some(PathBuf::from(".")));
         cfg.normalize();
         cfg.validate()?;
         Ok(cfg)
@@ -171,10 +224,11 @@ impl Config {
             },
             blogger: BloggerConfig { blog_id: String::new(), upload_via: default_upload_via(), one_wp_post_per_blogger_post: true },
             chrome: ChromeConfig { executable: None, user_data_dir: None, profile_directory: default_profile_dir(), headless: false, remote_debugging_port: default_debug_port(), launch_timeout_secs: default_launch_timeout() },
-            agent: AgentConfig { host: default_host(), port: default_agent_port(), poll_interval_secs: default_poll(), replace_in_db: true, enable_old_url_redirect_301: true, backup_before_replace: true, daemon_api_token: String::new() },
+            agent: AgentConfig { host: default_host(), port: default_agent_port(), poll_interval_secs: default_poll(), replace_in_db: true, enable_old_url_redirect_301: true, backup_before_replace: true, daemon_api_token: String::new(), scan_enabled: true, scan_interval_secs: default_scan_interval(), scan_batch_size: default_scan_batch(), finish_workers: default_finish_workers(), delete_local_after_offload: true },
             imgbb: ImgbbConfig::default(),
             cdn: CdnConfig::default(),
             logging: LoggingConfig { level: default_log_level() },
+            base_dir: Some(wp_path.clone()),
         };
         cfg.normalize();
         Ok(cfg)
@@ -182,6 +236,38 @@ impl Config {
 
     pub fn normalize(&mut self) {
         if self.site.url.ends_with('/') { self.site.url.pop(); }
+
+        // expand ${VAR:-default} placeholders so one config works on macOS + Linux
+        self.site.url = expand_env(&self.site.url);
+        self.site.wp_path = expand_env(&self.site.wp_path);
+        self.site.uploads_dir = expand_env(&self.site.uploads_dir);
+        self.database.host = expand_env(&self.database.host);
+        self.database.name = expand_env(&self.database.name);
+        self.database.user = expand_env(&self.database.user);
+        self.database.password = expand_env(&self.database.password);
+        self.agent.daemon_api_token = expand_env(&self.agent.daemon_api_token);
+        self.blogger.blog_id = expand_env(&self.blogger.blog_id);
+        self.imgbb.api_key = expand_env(&self.imgbb.api_key);
+        self.cdn.host = expand_env(&self.cdn.host);
+        if let Some(exe) = self.chrome.executable.as_ref() {
+            let expanded = expand_env(exe);
+            self.chrome.executable = if expanded.trim().is_empty() { None } else { Some(expanded) };
+        }
+        if let Some(dir) = self.chrome.user_data_dir.as_ref() {
+            let expanded = expand_env(dir);
+            self.chrome.user_data_dir = if expanded.trim().is_empty() { None } else { Some(expanded) };
+        }
+
+        // resolve relative paths against the config file directory
+        self.site.wp_path = self.resolve_path(&self.site.wp_path);
+        if self.site.uploads_dir.trim().is_empty() {
+            self.site.uploads_dir = self.resolve_path("wp-content/uploads");
+        } else {
+            self.site.uploads_dir = self.resolve_path(&self.site.uploads_dir);
+        }
+        if let Some(dir) = self.chrome.user_data_dir.clone() {
+            self.chrome.user_data_dir = Some(self.resolve_path(&dir));
+        }
         // split host:port in DB_HOST
         if let Some((h, p)) = self.database.host.split_once(':') {
             if let Ok(port) = p.parse::<u16>() { self.database.port = port; self.database.host = h.to_string(); }
@@ -197,6 +283,29 @@ impl Config {
         if self.database.user.is_empty() { return Err(Error::ConfigError("database.user is required".into())); }
         if self.blogger.blog_id.is_empty() { return Err(Error::ConfigError("blogger.blog_id is required".into())); }
         Ok(())
+    }
+
+    /// Resolve a possibly-relative path against the config file directory.
+    pub fn resolve_path(&self, p: &str) -> String {
+        let expanded = expand_env(p);
+        let trimmed = expanded.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let path = Path::new(trimmed);
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            match &self.base_dir {
+                Some(base) => base.join(path),
+                None => return trimmed.to_string(),
+            }
+        };
+        // clean up "..", "." segments when the path exists on disk
+        match std::fs::canonicalize(&joined) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => joined.to_string_lossy().to_string(),
+        }
     }
 
     pub fn mysql_opts(&self) -> mysql_async::OptsBuilder {

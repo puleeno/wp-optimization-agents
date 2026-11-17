@@ -16,7 +16,7 @@ import { DaemonMetrics } from '../types/dashboard';
 interface HeaderProps {
   activeTab: string;
   setActiveTab: (tab: string) => void;
-  daemonMetrics: DaemonMetrics;
+  daemonMetrics: DaemonMetrics | null;
   darkMode: boolean;
   setDarkMode: (val: boolean) => void;
   onTriggerAudit: () => void;
@@ -33,6 +33,7 @@ export const Header: React.FC<HeaderProps> = ({
   setDarkMode,
   onTriggerAudit,
   isAuditing,
+  auditStage,
   onOpenSidebar,
 }) => {
   const tabTitles: Record<string, string> = {
