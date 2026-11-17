@@ -7,6 +7,7 @@ interface ImageRepositoryInterface
     public function create(array $data): int|false;
     public function find_by_id(int $id): ?array;
     public function find_by_post_id(int $post_id): array;
+    public function find_by_attachment_id(int $attachment_id): array;
     public function find_by_origin_url(string $origin_url): ?array;
     public function find_by_origin_url_hash(string $hash): ?array;
     public function find_active_redirect_by_origin_url(string $origin_url): ?array;

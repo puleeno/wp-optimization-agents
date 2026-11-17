@@ -28,6 +28,8 @@ class Schema
             original_size_bytes bigint(20) unsigned DEFAULT NULL,
             offload_size_bytes bigint(20) unsigned DEFAULT NULL,
             status enum('pending','uploading','uploaded','replacing','replaced','failed') NOT NULL DEFAULT 'pending',
+            imgbb_url text DEFAULT NULL,
+            imgbb_status varchar(20) NOT NULL DEFAULT 'none',
             redirect_active tinyint(1) NOT NULL DEFAULT 0,
             replaced_at datetime DEFAULT NULL,
             error_message text DEFAULT NULL,
@@ -39,6 +41,7 @@ class Schema
             KEY attachment_id (attachment_id),
             KEY post_id (post_id),
             KEY status (status),
+            KEY imgbb_status (imgbb_status),
             KEY redirect_active (redirect_active),
             KEY blogger_image_id (blogger_image_id(191))
         ) $charset_collate;";

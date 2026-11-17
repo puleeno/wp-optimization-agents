@@ -4,6 +4,7 @@ namespace Puleeno\WPOptAgents;
 
 use Puleeno\WPOptAgents\Admin\Assets;
 use Puleeno\WPOptAgents\Admin\Menu;
+use Puleeno\WPOptAgents\Admin\MediaLibrary;
 use Puleeno\WPOptAgents\Admin\Pages\Renderer;
 use Puleeno\WPOptAgents\Admin\Settings;
 use Puleeno\WPOptAgents\Contracts\SettingsRepositoryInterface;
@@ -49,6 +50,7 @@ class Plugin
             $this->menu()->register();
             $this->assets()->register();
             $this->settingsController()->register();
+            $this->mediaLibrary()->register();
         }
 
         add_action('rest_api_init', [$this->restApi(), 'register_routes']);
@@ -207,6 +209,13 @@ class Plugin
     {
         return $this->make('assets', function () {
             return new Assets();
+        });
+    }
+
+    public function mediaLibrary(): MediaLibrary
+    {
+        return $this->make('media_library', function (Plugin $plugin) {
+            return new MediaLibrary($plugin->imageRepository());
         });
     }
 

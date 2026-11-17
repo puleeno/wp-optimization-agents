@@ -62,6 +62,12 @@ class RestApi
             'permission_callback' => [$this, 'check_daemon_permission'],
         ]);
 
+        register_rest_route($namespace, '/images/(?P<id>\d+)/imgbb', [
+            'methods' => 'POST',
+            'callback' => [$this, 'mark_image_imgbb'],
+            'permission_callback' => [$this, 'check_daemon_permission'],
+        ]);
+
         register_rest_route($namespace, '/images/(?P<id>\d+)/replaced', [
             'methods' => 'POST',
             'callback' => [$this, 'mark_image_replaced'],
@@ -219,6 +225,20 @@ class RestApi
             : ApiResponse::error('Failed to update image', 500));
     }
 
+    public function mark_image_imgbb(WP_REST_Request $request): WP_REST_Response
+    {
+        $image_id = (int)$request->get_param('id');
+        $params = $request->get_json_params() ?: [];
+        $imgbb_url = (string)($params['imgbb_url'] ?? $params['url'] ?? '');
+        if ($imgbb_url === '') {
+            return $this->respond(ApiResponse::error('imgbb_url is required', 400));
+        }
+        $result = $this->offloadService->mark_imgbb_uploaded($image_id, $imgbb_url);
+        return $this->respond($result
+            ? ApiResponse::success(['imgbb_uploaded' => true, 'image_id' => $image_id, 'imgbb_url' => $imgbb_url])
+            : ApiResponse::error('Failed to update imgbb status', 500));
+    }
+
     public function mark_image_replaced(WP_REST_Request $request): WP_REST_Response
     {
         $image_id = (int)$request->get_param('id');
@@ -242,18 +262,19 @@ class RestApi
     public function get_image_sizes(WP_REST_Request $request): WP_REST_Response
     {
         $image_id = (int)$request->get_param('id');
-        $image = $this->imageRepository->find_by_id($image_id);
+        $repo = new \Puleeno\WPOptAgents\Repository\ImageRepository();
+        $image = $repo->find_by_id($image_id);
         if (!$image) {
             return $this->respond(ApiResponse::error('Image not found', 404));
         }
-        
+
         $sizes = [];
         if (!empty($image['metadata']) && is_array($image['metadata'])) {
             if (isset($image['metadata']['sizes']) && is_array($image['metadata']['sizes'])) {
                 $sizes = $image['metadata']['sizes'];
             }
         }
-        
+
         return $this->respond(ApiResponse::success([
             'image_id' => $image['id'],
             'origin_url' => $image['origin_url'],

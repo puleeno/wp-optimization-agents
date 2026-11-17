@@ -122,6 +122,20 @@ class OffloadService implements OffloadServiceInterface
         ]);
     }
 
+    public function mark_imgbb_uploaded(int $image_id, string $imgbb_url): bool
+    {
+        $existing = $this->imageRepository->find_by_id($image_id);
+        $meta = is_array($existing['metadata'] ?? null) ? $existing['metadata'] : [];
+        $meta['imgbb_uploaded_at'] = current_time('mysql');
+        $meta['imgbb_url'] = $imgbb_url;
+        return $this->imageRepository->update($image_id, [
+            'imgbb_url' => $imgbb_url,
+            'imgbb_status' => 'uploaded',
+            'metadata' => $meta,
+            'error_message' => null,
+        ]);
+    }
+
     public function mark_image_replaced(int $image_id): bool
     {
         return $this->imageRepository->mark_replaced($image_id, true);

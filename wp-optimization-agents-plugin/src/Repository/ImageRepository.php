@@ -46,6 +46,8 @@ class ImageRepository implements ImageRepositoryInterface
             'origin_url_hash' => '',
             'blogger_url' => null,
             'blogger_image_id' => null,
+            'imgbb_url' => null,
+            'imgbb_status' => 'none',
             'transformed_params' => null,
             'width' => null,
             'height' => null,
@@ -83,6 +85,16 @@ class ImageRepository implements ImageRepositoryInterface
         $sql = $this->wpdb->prepare(
             "SELECT * FROM {$this->table_name} WHERE post_id = %d ORDER BY created_at ASC",
             $post_id
+        );
+        $rows = $this->wpdb->get_results($sql, ARRAY_A) ?: [];
+        return array_map([$this, 'decode_row'], $rows);
+    }
+
+    public function find_by_attachment_id(int $attachment_id): array
+    {
+        $sql = $this->wpdb->prepare(
+            "SELECT * FROM {$this->table_name} WHERE attachment_id = %d ORDER BY created_at ASC, id ASC",
+            $attachment_id
         );
         $rows = $this->wpdb->get_results($sql, ARRAY_A) ?: [];
         return array_map([$this, 'decode_row'], $rows);
@@ -185,6 +197,9 @@ class ImageRepository implements ImageRepositoryInterface
             $row['metadata'] = is_array($decoded) ? $decoded : $row['metadata'];
         }
         $row['redirect_active'] = (int)($row['redirect_active'] ?? 0);
+        if (!isset($row['imgbb_status']) || $row['imgbb_status'] === null || $row['imgbb_status'] === '') {
+            $row['imgbb_status'] = !empty($row['imgbb_url']) ? 'uploaded' : 'none';
+        }
         return $row;
     }
 }

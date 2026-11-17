@@ -61,3 +61,22 @@
 #offload-images-table .status-pending { color: #ffb900; }
 #offload-images-table .status-processing { color: #007cba; }
 #offload-images-table .status-failed { color: #dc3232; }
+/* Media library upload status columns */
+.column-wpoa_imgbb, .column-wpoa_blogger { width: 140px; }
+.wpoa-upload-status {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.6;
+    white-space: nowrap;
+}
+.wpoa-status-none, .wpoa-status-na { background: #f0f0f1; color: #646970; }
+.wpoa-status-pending { background: #fcf0c9; color: #8a6d1d; }
+.wpoa-status-uploading, .wpoa-status-processing { background: #cce5ff; color: #004085; }
+.wpoa-status-uploaded { background: #d4edda; color: #155724; }
+.wpoa-status-replaced { background: #c6f6d5; color: #22543d; }
+.wpoa-status-failed { background: #f8d7da; color: #721c24; }
+.wpoa-upload-meta { margin-top: 4px; font-size: 11px; color: #646970; }
+.wpoa-upload-meta a { text-decoration: none; }
