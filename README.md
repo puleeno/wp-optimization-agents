@@ -8,7 +8,8 @@ WordPress media offload agents (Rust daemon + Python orchestration + web dashboa
 - `python/` — Python orchestration/scripts (API clients, workflows, monitoring). See `python/README.md`.
 
 ## Documents
-- [SETUP.md](SETUP.md) — environment setup, build, run, configuration.
+- [SETUP.md](SETUP.md) — **setup đầy đủ cho macOS / Linux / Windows**: build, config (`${VAR}` + đường dẫn tương đối), plugin WordPress, service (launchd / systemd / NSSM), vận hành, troubleshooting.
+- [config.example.json](config.example.json) — config mẫu production (portable, không chứa path macOS).
 - [RELEASE.md](RELEASE.md) — release checklist, versioning, build artifacts, deployment/rollback.
 
 ## Quick start

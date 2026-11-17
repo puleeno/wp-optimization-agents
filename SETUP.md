@@ -1,500 +1,315 @@
-# WP Offload Daemon - Complete Setup Guide
+# WP Offload Agents — Setup Guide (macOS · Linux · Windows)
 
-End-to-end setup for running the **WP Optimization Agents** daemon that offloads WordPress images to Blogger via **Chrome Web UI automation** (no Google/Blogger API, no OAuth). Covers macOS (launchd) and Linux (systemd).
+Điều khiển từ xa: **Rust daemon** (`wp-offload-daemon`) chạy HTTP API + Web UI tại cổng **2095**, đọc/ghi WordPress MySQL, upload ảnh lên **imgbb (backup)** → **CDN proxy** → **Blogger qua Chrome CDP**, rồi **crop/resize** theo từng image size và cập nhật CDN sang phiên bản mới nhất.
+
+> Không dùng Google/Blogger API, không OAuth. Mọi thao tác Blogger thực hiện trên Chrome profile đã đăng nhập.
 
 ---
 
-## Architecture Overview
+## 1. Kiến trúc & luồng xử lý
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      WP OFFLOAD DAEMON                              │
-│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────────────┐    │
-│  │   Axum      │  │  Offload     │  │  Blogger Uploader       │    │
-│  │   HTTP      │──│  Engine      │──│  (Chrome CDP)           │    │
-│  │   API/UI    │  │  (Rust)      │  │  • 1 WP post = 1 post   │    │
-│  └─────────────┘  └──────────────┘  │  • Picker upload       │    │
-│         │               │           │  • Trusted clicks      │    │
-│         ▼               ▼           │  • Wait settled        │    │
-│  ┌─────────────────────────────────┐ │  • Extract post ID    │    │
-│  │      MySQL (WordPress DB)       │ │  └─────────────────────┘    │
-│  │  • nsxu_wp_opt_agents_images    │ │         │                    │
-│  │  • postmeta (_wpoa_*)           │ │         ▼                    │
-│  └─────────────────────────────────┘ │  ┌─────────────────────┐    │
-│         │               ▲            │  │  WP Plugin          │    │
-│         ▼               │            │  │  • 301 redirects    │    │
-│  ┌─────────────────────────────────┐ │  │  • REST compat API  │    │
-│  │  Chrome Browser (user profile)  │ │  │  • DB schema        │    │
-│  │  • Signed into Blogger/Google   │ │  └─────────────────────┘    │
-│  └─────────────────────────────────┘ └─────────────────────────────┘
+WP media upload (hook wp_generate_attachment_metadata)
+        │  POST /api/webhooks/media-upload (Bearer token)
+        ▼
+┌──────────────────────── wp-offload-daemon (:2095) ────────────────────────┐
+│  webhook  → imgbb upload (url | blob)  → CDN map + url_versions           │
+│           → replace URL trong post_content/postmeta/options               │
+│           → queue Blogger (status=queued)                                 │
+│                                                                          │
+│  blogger worker (Chrome CDP): queued → uploaded                           │
+│  finish worker  (song song, N luồng): uploaded → finished                 │
+│           → crop/resize theo attachment_id + image_size                   │
+│           → CDN trỏ bản Blogger mới nhất                                   │
+│                                                                          │
+│  media scan worker: mỗi scan_interval_secs quét attachment chưa xử lý      │
+│  audit: Chrome headless đo LCP/FCP/CLS/TTFB (POST /api/audits/run)        │
+└───────────────────────────────────────────────────────────────────────────┘
+        │                         │                        │
+        ▼                         ▼                        ▼
+   MySQL (WP DB)            imgbb (backup)          Blogger (Chrome UI)
 ```
 
-**Key behaviors:**
-- **No Google/Blogger API** — uses Chrome DevTools Protocol (CDP) against Blogger web UI
-- **1 WordPress post = 1 Blogger post/album** — all images for a post uploaded to single Blogger post
-- **WP↔Blogger linking** — stored in WP postmeta (`_wpoa_blogger_post_id`, `_wpoa_blogger_post_url`, etc.)
-- **DB-driven URL replacement** — daemon rewrites `post_content` + `postmeta` + `options`, backs up original
-- **301 redirects** — PHP plugin serves 301 from old WP image URLs to Blogger URLs when `redirect_active=1`
+**Trạng thái job Blogger:** `queued → uploaded → finished` (`failed` khi lỗi, xem `last_error`).
 
 ---
 
-## Prerequisites
+## 2. Yêu cầu
 
-### System Requirements
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| **OS** | macOS 12+ / Ubuntu 20.04+ / Debian 11+ | Latest LTS |
-| **Rust** | 1.75+ | 1.80+ |
-| **Chrome/Chromium** | 118+ | Latest stable |
-| **MySQL/MariaDB** | 5.7+ / 10.3+ | 8.0 / 10.6+ |
-| **WordPress** | 6.0+ | 6.5+ |
-| **PHP** | 8.1+ | 8.3+ |
-| **Composer** | 2.0+ | Latest |
+| Thành phần | Tối thiểu | Gợi ý |
+|---|---|---|
+| OS | macOS 12 · Ubuntu 20.04/Debian 11 · Windows 10 1809+ | bản LTS mới |
+| Rust | 1.75+ | 1.80+ |
+| Chrome/Chromium | 118+ | bản stable mới |
+| MySQL/MariaDB | 5.7 / 10.3 | 8.0 / 10.6 |
+| WordPress | 6.0+ | 6.5+ |
+| PHP | 8.1+ | 8.3+ |
+| Node.js | 18+ (chỉ để build UI) | 20+ |
 
-### WordPress Site (nghesachxua.com)
-- Database: `nghesachxua` (user `root`, pass `root`, host `localhost`)
-- Table prefix: `nsxu_` (from `wp-config.php`)
-- Uploads directory: `/path/to/wordpress/wp-content/uploads`
-
-### Chrome Profile (Critical)
-- Must have a **Chrome profile already signed into Blogger/Google**
-- Profile will be used by daemon for automated uploads
-- **Do not use headless mode** for initial setup (Google sign-in requires visible browser)
+**Chrome profile (bắt buộc):** profile đã đăng nhập Blogger/Google.
+- Không bật headless cho lần đăng nhập đầu; sau đó có thể đặt `chrome.headless=true` (audit luôn headless).
+- **Không mở Chrome bằng profile đó trong khi daemon chạy** — nếu Chrome đang chạy sẵn, `--remote-debugging-port` bị bỏ qua và job Blogger lỗi `DevTools not ready on port 9222`.
+- Cổng debug mặc định `9222` (`chrome.remote_debugging_port`).
 
 ---
 
-## Step 1: Build the Daemon
+## 3. Build
+
+### 3.1 macOS / Linux
 
 ```bash
-cd /Users/puleeno/Projects/nghesachxua.com/agents/daemon
+git clone <repo> && cd nghesachxua.com/agents
 
-# Install Rust if not present
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
+# (tuỳ chọn) Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh && source "$HOME/.cargo/env"
 
-# Build release binary (~2 min)
-cargo build --release
+# Web UI (bắt buộc: daemon serve dist/)
+cd web-ui && npm install && npm run build && cd ..
 
-# Verify binary
-./target/release/wp-offload-daemon --help
+# Daemon
+cd daemon && cargo build --release
+# artefact: target/release/wp-offload-daemon
 ```
 
-**Expected output:** Binary at `target/release/wp-offload-daemon` (~7 MB)
+### 3.2 Windows (PowerShell)
+
+```powershell
+# Rust: cài https://rustup.rs (winget install Rustlang.Rustup hoặc tải installer)
+# Node: winget install OpenJS.NodeJS.LTS
+
+cd agents\web-ui; npm install; npm run build
+cd ..\daemon; cargo build --release
+# artefact: target\release\wp-offload-daemon.exe
+```
 
 ---
 
-## Step 2: Prepare WordPress Plugin
+## 4. Cấu hình
 
-### 2.1 Deploy Plugin
+### 4.1 File & biến môi trường
+
+| Biến | Ý nghĩa | Mặc định |
+|---|---|---|
+| `DAEMON_CONFIG` | đường dẫn config JSON | bắt buộc (hoặc `WP_CONFIG_PATH` + `BLOGGER_BLOG_ID` + `SITE_URL`) |
+| `WEB_UI_DIST` | thư mục SPA đã build | `<repo>/web-ui/dist` |
+| `DAEMON_HOST` / `DAEMON_PORT` (`PORT`) | override host/port | theo config |
+| `RUST_LOG` | mức log | `info` |
+
+File config hỗ trợ **placeholder `${VAR}` / `${VAR:-default}`** (ưu tiên biến môi trường) và **đường dẫn tương đối** (quy chiếu thư mục chứa config, tự canonicalize):
+
+```json
+"site": {
+  "url": "${SITE_URL:-https://nghesachxua.localhost}",
+  "wp_path": "${WP_PATH:-../..}",
+  "uploads_dir": "${WP_UPLOADS_DIR:-../wp-content/uploads}"
+},
+"database": { "host": "${DB_HOST:-127.0.0.1}", "user": "${DB_USER:-root}", "password": "${DB_PASSWORD:-root}", "name": "${DB_NAME:-nghesachxua}" }
+```
+
+Mẫu đầy đủ: `agents/config.example.json`.
+
+### 4.2 Giải thích trường
+
+| Nhóm | Trường | Ghi chú |
+|---|---|---|
+| `database` | `host,port,user,password,name,table_prefix` | prefix `nsxu_` theo `wp-config.php` |
+| `site` | `url`, `wp_path`, `uploads_dir` | `uploads_dir` để tìm file local khi imgbb `blob` |
+| `agent` | `host`,`port`,`poll_interval_secs`,`replace_in_db`,`backup_before_replace`,`enable_old_url_redirect_301`,`daemon_api_token` | token phải trùng plugin WP |
+| `agent` | `scan_enabled`,`scan_interval_secs`,`scan_batch_size` | worker tự quét media chưa xử lý |
+| `agent` | `finish_workers`,`delete_local_after_offload` | luồng crop/resize song song; **tắt xoá file gốc** nếu chưa an tâm |
+| `imgbb` | `enabled`,`api_key`,`upload_format` | `blob` = upload file local (local/private WP); `url` = imgbb tự tải URL (cần public) |
+| `cdn` | `host`,`scheme` | domain proxy `/wp-content/uploads/...` |
+| `chrome` | `executable`,`user_data_dir`,`profile_directory`,`headless`,`remote_debugging_port`,`launch_timeout_secs` | để trống executable/user_data_dir = **tự dò theo OS** |
+| `blogger` | `blog_id`,`upload_via`,`one_wp_post_per_blogger_post` | `blog_id` là ID thật (không để `YOUR_...`) |
+| `logging` | `level` | `info` mặc định |
+
+### 4.3 Giá trị mặc định theo OS
+
+| OS | Chrome executable | Chrome user data dir |
+|---|---|---|
+| macOS | `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` | `~/Library/Application Support/Google/Chrome` |
+| Linux | `/usr/bin/google-chrome` → `chromium` → `microsoft-edge` | `~/.config/google-chrome` |
+| Windows | `C:\Program Files\Google\Chrome\Application\chrome.exe` | `%LOCALAPPDATA%\Google\Chrome\User Data` |
+
+Để trống 2 trường này trong config ⇒ daemon tự chọn theo OS.
+
+---
+
+## 5. Plugin WordPress
+
 ```bash
-# On your WordPress server (or local wp-content/plugins)
 PLUGIN_DIR="/path/to/wordpress/wp-content/plugins/wp-optimization-agents"
 mkdir -p "$PLUGIN_DIR"
-
-# Copy plugin source
-rsync -av /Users/puleeno/Projects/nghesachxua.com/agents/wp-optimization-agents-plugin/ "$PLUGIN_DIR/"
-
-# Install PHP dependencies
-cd "$PLUGIN_DIR"
-composer install --no-dev --optimize-autoloader
+rsync -av agents/wp-optimization-agents-plugin/ "$PLUGIN_DIR/"
+cd "$PLUGIN_DIR" && composer install --no-dev --optimize-autoloader
 ```
 
-### 2.2 Activate & Configure
-1. **WP Admin → Plugins → Activate "WP Optimization Agents"**
-   - Creates/upgrades tables: `nsxu_wp_opt_agents_images`, `nsxu_wp_opt_agents_jobs` (DB v2.0.0)
+Trong **WP Admin → WP Opt Agents → Settings**:
 
-2. **WP Admin → WP Opt Agents → Settings**
-   Configure these required fields:
+| Trường (WP Admin) | Giá trị |
+|---|---|
+| **Daemon URL** | `http://<agent-host>:2095` |
+| **Plugin/Daemon API Token** | trùng `agent.daemon_api_token` (trong `agents/config.json`) |
+| **Notify Daemon on Media Upload** | **ON** — gửi webhook `POST /api/webhooks/media-upload` khi có media mới |
 
-   | Section | Field | Value |
-   |---------|-------|-------|
-   | **Blogger / Chrome** | Blogger Blog ID | `1234567890123456789` (from Blogger URL) |
-   | | Chrome Profile | `Default` (or your profile name) |
-   | | Chrome Executable | `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` (macOS) or `/usr/bin/google-chrome` (Linux) |
-   | | Chrome User Data Dir | `/Users/you/Library/Application Support/Google/Chrome` (macOS) or `/home/you/.config/google-chrome` (Linux) |
-   | | Headless Chrome | **OFF** (required for Google sign-in) |
-   | **Media Offload** | Replace URLs in WP DB | **ON** |
-   | | Backup Before Rewrite | **ON** |
-   | | 301 Redirect Old URL → New | **ON** |
-   | **Agent Daemon** | Daemon Port | `2095` |
-   | | Poll Interval (seconds) | `60` |
-   | | API Token | (generate a random string, e.g., `openssl rand -hex 32`) |
+> Blogger/Chrome/imgbb/CDN **không** cấu hình trong plugin — tất cả nằm ở `agents/config.json` (hoặc `/config` trên UI).
 
-3. **Click "Save Settings"** — this writes clean options without legacy keys
+Plugin tạo/bảo trì bảng `*_wp_opt_agents_images`, `*_wp_opt_agents_jobs`. Các bảng pipeline còn lại (`*_wp_opt_agents_cdn_map`, `*_wp_opt_agents_url_versions`, `*_wp_opt_agents_blogger_queue`, `*_wp_opt_agents_logs`, `*_wp_opt_agents_audits`) do daemon tự tạo.
 
-### 2.3 Verify Plugin Tables
+Kiểm tra:
 ```sql
--- In MySQL
-USE nghesachxua;
 SHOW TABLES LIKE 'nsxu_wp_opt_agents%';
--- Should show: nsxu_wp_opt_agents_images, nsxu_wp_opt_agents_jobs
-
-DESCRIBE nsxu_wp_opt_agents_images;
--- Should have: id, origin_url, origin_url_hash, blogger_url, blogger_image_id,
---              wp_post_id, wp_attachment_id, status, redirect_active, replaced_at, ...
 ```
 
 ---
 
-## Step 3: Create Daemon Configuration
+## 6. Chạy thử trước
 
-Create `/Users/puleeno/Projects/nghesachxua.com/agents/config.json`:
-
-```json
-{
-  "database": {
-    "host": "localhost",
-    "port": 3306,
-    "username": "root",
-    "password": "root",
-    "name": "nghesachxua",
-    "table_prefix": "nsxu_"
-  },
-  "site": {
-    "url": "https://nghesachxua.localhost",
-    "uploads_dir": "/Users/puleeno/Projects/nghesachxua.com/wp-content/uploads"
-  },
-  "blogger": {
-    "blog_id": "1234567890123456789",
-    "upload_via": "chrome_web_ui",
-    "one_wp_post_per_blogger_post": true
-  },
-  "chrome": {
-    "executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "user_data_dir": "/Users/puleeno/Library/Application Support/Google/Chrome",
-    "profile_directory": "Default",
-    "headless": false,
-    "remote_debugging_port": 9222,
-    "launch_timeout_secs": 30
-  },
-  "agent": {
-    "host": "127.0.0.1",
-    "port": 2095,
-    "poll_interval_secs": 60,
-    "replace_in_db": true,
-    "backup_before_replace": true,
-    "enable_old_url_redirect_301": true,
-    "daemon_api_token": "your-generated-token-here"
-  },
-  "logging": {
-    "level": "info",
-    "json": false
-  }
-}
+```bash
+DAEMON_CONFIG=$PWD/agents/config.json WEB_UI_DIST=$PWD/agents/web-ui/dist \
+  RUST_LOG=info ./agents/daemon/target/release/wp-offload-daemon
 ```
 
-**Linux paths:**
-```json
-"chrome": {
-  "executable": "/usr/bin/google-chrome",
-  "user_data_dir": "/home/www-data/.config/google-chrome",
-  "profile_directory": "Default"
-}
-```
+Mở `http://localhost:2095`, kiểm tra lần lượt:
+
+| Kiểm tra | Kỳ vọng |
+|---|---|
+| `GET /api/health` | `200` |
+| `GET /api/metrics` | có `uptimeSeconds`, `memoryMb`, `cpuPercent`, `tokioWorkers` |
+| `GET /api/config` | có `_meta.path` (đường dẫn config đang dùng), `cdn`, `imgbb`, `agent.scan_*` |
+| `GET /api/chrome/preflight` | `chrome_exists`, `profile_exists`, `port_open` + `advice` |
+| `GET /api/scan/status` | `imgbb_ready`, `blogger_ready`, `queue`, `pending` |
+| `/scanner`, `/config`, `/daemon` | UI 200 (SPA fallback) |
 
 ---
 
-## Step 4: Install & Run as Service
+## 7. Cài như service
 
-### macOS (launchd)
-
-```bash
-cd /Users/puleeno/Projects/nghesachxua.com/agents/daemon
-
-# Make install script executable
-chmod +x install.sh
-
-# Install (requires sudo)
-sudo ./install.sh install
-```
-
-**What it does:**
-- Copies binary to `/usr/local/bin/wp-offload-daemon`
-- Installs `/Library/LaunchDaemons/com.puleeno.wp-offload-daemon.plist`
-- Loads and starts service
-
-**Manage service:**
-```bash
-# Status
-launchctl list | grep wp-offload
-
-# Logs
-tail -f /var/log/wp-offload-daemon/stdout.log
-tail -f /var/log/wp-offload-daemon/stderr.log
-
-# Stop
-sudo launchctl stop com.puleeno.wp-offload-daemon
-
-# Start
-sudo launchctl start com.puleeno.wp-offload-daemon
-
-# Uninstall
-sudo ./install.sh uninstall
-```
-
-### Linux (systemd)
+### 7.1 macOS (launchd)
 
 ```bash
-# Copy project to server
-rsync -av /Users/puleeno/Projects/nghesachxua.com/ user@server:/opt/nghesachxua.com/
-
-# On server
-cd /opt/nghesachxua.com/agents/daemon
-chmod +x install.sh
-sudo ./install.sh install
-```
-
-**Manage service:**
-```bash
-# Status
-systemctl status wp-offload-daemon
-
-# Logs
-journalctl -u wp-offload-daemon -f
-
-# Restart
-sudo systemctl restart wp-offload-daemon
-
-# Stop
-sudo systemctl stop wp-offload-daemon
-
-# Uninstall
-sudo ./install.sh uninstall
-```
-
----
-
-## Step 5: Verify Dashboard & API
-
-### 5.1 Dashboard UI
-Open browser: **http://localhost:2095**
-
-You should see the React dashboard with tabs:
-- **Overview** — stats, quick actions
-- **Blogger Lab** — manual upload testing
-- **Daemon Engine** — poll loop status
-- **WordPress Scanner** — post/image discovery
-- **Daily Audit** — Lighthouse integration
-- **Config** — live config view
-
-### 5.2 Health Check
-```bash
-curl http://localhost:2095/health
-# {"status":"ok"}
-
-curl http://localhost:2095/api/health
-# {"status":"ok","uptime_secs":...,"db_connected":true,"chrome_ready":true}
-```
-
-### 5.3 Process a Post (Manual Trigger)
-```bash
-# Get a post ID with local images
-curl -X POST http://localhost:2095/api/posts/123/process
-
-# Response:
-# {
-#   "post_id": 123,
-#   "blogger": {"post_id": "987654321", "post_url": "https://www.blogger.com/blog/post/edit/..."},
-#   "uploaded_now": 5,
-#   "replacements_applied": 10,
-#   "replaced_mappings": 5,
-#   "total_images": 5
-# }
-```
-
----
-
-## Step 6: Test End-to-End Flow
-
-### 6.1 Find a Test Post
-```sql
--- Posts with local images in content
-SELECT p.ID, p.post_title, p.post_content
-FROM nsxu_posts p
-WHERE p.post_content LIKE '%wp-content/uploads%'
-  AND p.post_status = 'publish'
-LIMIT 5;
-```
-
-### 6.2 Run Offload
-```bash
-# Replace 123 with actual post ID
-curl -X POST http://localhost:2095/api/posts/123/process
-```
-
-### 6.3 Verify Results
-1. **Dashboard → Blogger Lab** — shows uploaded images
-2. **MySQL** — check mappings:
-   ```sql
-   SELECT origin_url, blogger_url, status, redirect_active
-   FROM nsxu_wp_opt_agents_images
-   WHERE wp_post_id = 123;
-   ```
-3. **WP Postmeta** — check link:
-   ```sql
-   SELECT meta_key, meta_value
-   FROM nsxu_postmeta
-   WHERE post_id = 123 AND meta_key LIKE '_wpoa_%';
-   ```
-4. **Blogger** — open the post URL, verify all images present
-5. **301 Redirect Test**:
-   ```bash
-   curl -I "https://nghesachxua.localhost/wp-content/uploads/2024/01/test-image.jpg"
-   # Should return 301 → Blogger URL
-   ```
-
----
-
-## Troubleshooting
-
-### Chrome Won't Launch / CDP Connection Failed
-```bash
-# Check Chrome path
-ls -la "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-
-# Check user data dir exists
-ls -la "/Users/puleeno/Library/Application Support/Google/Chrome/Default"
-
-# Port 9222 free?
-lsof -i :9222
-# Kill any existing Chrome with remote debugging
-pkill -f "remote-debugging-port=9222"
-```
-
-### "Google sign-in required" in Logs
-- Ensure Chrome profile is **already signed into Blogger**
-- Run Chrome manually with that profile, go to blogger.com, verify signed in
-- **Do not use headless mode** until sign-in is confirmed working
-- Daemon uses existing profile — it does NOT handle OAuth flow
-
-### Database Connection Failed
-```bash
-# Test MySQL connectivity
-mysql -h localhost -u root -proot nghesachxua -e "SELECT 1"
-
-# Check config.json database section matches wp-config.php
-```
-
-### Images Not Uploading / Picker Failed
-- Blogger UI selectors may have changed (localized VN/EN)
-- Check `blogger.rs` selectors for `Tải lên từ máy tính` / `Upload from computer`
-- Increase timeouts in config if network slow
-- Check logs for `picker_set_file` success/failure
-
-### 301 Redirect Not Working
-```sql
--- Verify mapping has redirect_active=1 and status=replaced
-SELECT * FROM nsxu_wp_opt_agents_images
-WHERE origin_url = '...' AND redirect_active = 1 AND status = 'replaced';
-
--- Check plugin setting
-SELECT option_value FROM nsxu_options WHERE option_name = 'wp_opt_agents_settings';
--- JSON should contain "enable_old_url_redirect_301":true
-```
-
-### Service Won't Start (macOS)
-```bash
-# Check plist syntax
-plutil -lint /Library/LaunchDaemons/com.puleeno.wp-offload-daemon.plist
-
-# Check logs
-tail -f /var/log/wp-offload-daemon/stderr.log
-
-# Common: binary path wrong, config file missing, permissions
-```
-
-### Service Won't Start (Linux)
-```bash
-# Check service file
-systemctl cat wp-offload-daemon
-
-# Check journal
-journalctl -u wp-offload-daemon -n 50 --no-pager
-
-# Common: User www-data lacks Chrome profile access, config path wrong
-```
-
----
-
-## Configuration Reference
-
-### Environment Variables (override config.json)
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DAEMON_CONFIG` | Path to config.json | — |
-| `DAEMON_HOST` | Bind host | `127.0.0.1` |
-| `DAEMON_PORT` / `PORT` | Bind port | `2095` |
-| `WEB_UI_DIST` | Dashboard build directory | — |
-| `WP_CONFIG_PATH` | Path to wp-config.php (bootstrap) | — |
-| `BLOGGER_BLOG_ID` | Blogger blog ID (bootstrap) | — |
-| `SITE_URL` | WordPress site URL (bootstrap) | — |
-| `RUST_LOG` | Log level (trace/debug/info/warn/error) | `info` |
-
-### Config.json Sections
-```json
-{
-  "database": { "host", "port", "username", "password", "name", "table_prefix" },
-  "site": { "url", "uploads_dir" },
-  "blogger": { "blog_id", "upload_via", "one_wp_post_per_blogger_post" },
-  "chrome": { "executable", "user_data_dir", "profile_directory", "headless", "remote_debugging_port", "launch_timeout_secs" },
-  "agent": { "host", "port", "poll_interval_secs", "replace_in_db", "backup_before_replace", "enable_old_url_redirect_301", "daemon_api_token" },
-  "logging": { "level", "json" }
-}
-```
-
----
-
-## Security Notes
-
-1. **Chrome profile** — contains Google auth cookies; restrict access to daemon user only
-2. **Database credentials** — config.json should be `chmod 600`, owned by daemon user
-3. **API token** — used for plugin REST compatibility; generate strong random value
-4. **Network** — daemon binds to `127.0.0.1:2095` by default; use reverse proxy (nginx) for external access with TLS
-5. **Logs** — may contain URLs; rotate and restrict access
-
----
-
-## Updating
-
-```bash
-# Pull latest changes
-cd /Users/puleeno/Projects/nghesachxua.com
-git pull
-
-# Rebuild
 cd agents/daemon
-cargo build --release
+sudo ./install.sh install          # copy binary → /usr/local/bin, cài plist, load service
+```
 
-# Restart service
-# macOS:
-sudo launchctl stop com.puleeno.wp-offload-daemon
-sudo launchctl start com.puleeno.wp-offload-daemon
+`~/Library/LaunchDaemons` → file hệ thống: `/Library/LaunchDaemons/com.puleeno.wp-offload-daemon.plist` (sửa `DAEMON_CONFIG`, `WEB_UI_DIST`, `WorkingDirectory` nếu repo không nằm ở `/Users/puleeno/Projects/nghesachxua.com`).
 
-# Linux:
-sudo systemctl restart wp-offload-daemon
+```bash
+launchctl list | grep wp-offload
+tail -f /var/log/wp-offload-daemon/stdout.log
+sudo launchctl bootout system /Library/LaunchDaemons/com.puleeno.wp-offload-daemon.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.puleeno.wp-offload-daemon.plist
+# hoặc: sudo launchctl kickstart -k system/com.puleeno.wp-offload-daemon
+```
+
+### 7.2 Linux (systemd)
+
+```bash
+sudo rsync -av agents/ /opt/wp-opt-agents/
+cd /opt/wp-opt-agents/daemon && sudo ./install.sh install
+```
+
+Unit mẫu `agents/daemon/linux/wp-offload-daemon.service` — cần chỉnh cho production:
+
+```ini
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/wp-opt-agents
+ExecStart=/usr/local/bin/wp-offload-daemon
+Environment=RUST_LOG=info
+Environment=DAEMON_CONFIG=/opt/wp-opt-agents/agents/config.json
+Environment=WEB_UI_DIST=/opt/wp-opt-agents/agents/web-ui/dist
+Restart=on-failure
+RestartSec=10
+# Chrome cần profile ghi được + /dev/shm; nếu dùng profile ở /home/* hãy tắt ProtectHome
+ProtectHome=false
+PrivateTmp=false
+ReadWritePaths=/opt/wp-opt-agents /var/log/wp-offload-daemon /var/lib/wp-offload-daemon
+```
+
+Với `User=www-data`, đặt `chrome.user_data_dir=/var/lib/wp-offload-daemon/chrome` (và `mkdir -p` + `chown www-data`), hoặc chạy service bằng user của bạn.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now wp-offload-daemon
+journalctl -u wp-offload-daemon -f
+```
+
+### 7.3 Windows
+
+Không có `install.sh` cho Windows. Chạy 2 cách:
+
+**A. Task Scheduler (đơn giản):** tạo task *At startup* → Action `Start a program` = `C:\wp-opt-agents\wp-offload-daemon.exe`, *Start in* = `C:\wp-opt-agents`, tick *Run whether user is logged on or not*.
+
+**B. NSSM (khuyến nghị):**
+```powershell
+winget install NSSM.NSSM
+nssm install wp-offload-daemon C:\wp-opt-agents\wp-offload-daemon.exe
+nssm set wp-offload-daemon AppDirectory C:\wp-opt-agents
+nssm set wp-offload-daemon AppEnvironmentExtra DAEMON_CONFIG=C:\wp-opt-agents\config.json WEB_UI_DIST=C:\wp-opt-agents\web-ui\dist RUST_LOG=info
+nssm set wp-offload-daemon Start SERVICE_AUTO_START
+nssm start wp-offload-daemon
+```
+
+Lưu ý Windows:
+- `chrome.user_data_dir` nên trỏ `C:\Users\<user>\AppData\Local\Google\Chrome\User Data`; service chạy `LocalSystem` có thể không thấy profile của user → dùng task "Run only when user is logged on" hoặc tách profile riêng.
+- Nếu chạy dạng service, đặt `chrome.headless=true` và dùng profile riêng đã đăng nhập Blogger.
+
+---
+
+## 8. Vận hành
+
+### 8.1 API chính
+
+| Endpoint | Mô tả |
+|---|---|
+| `GET /api/health` · `GET /api/metrics` | trạng thái, uptime, RAM, CPU, tokio workers |
+| `GET /api/config` · `PUT /api/config` | đọc/ghi config (merge + validate, ghi atomic, cập nhật live) |
+| `GET /api/attachments?limit&offset` | danh sách media (header `x-total-count`) |
+| `POST /api/attachments/:id/process` | offload 1 attachment ngay |
+| `POST /api/scan/run` · `GET /api/scan/status` | chạy ngay / xem hàng đợi worker |
+| `POST /api/audits/run` · `GET /api/audits` | audit tốc độ bằng Chrome headless |
+| `GET /api/chrome/preflight` | kiểm tra Chrome/profile/port debug |
+| `GET /api/logs?level&subsystem&q&attachment_id&limit&offset` | log chi tiết (bảng `*_wp_opt_agents_logs`) |
+| `GET /api/logs/stream` · `GET /api/tasks/stream` | SSE realtime log / task |
+| `GET /cdn/*path` | CDN proxy (imgbb → Blogger bản mới nhất) |
+
+### 8.2 Web UI
+- `/` tổng quan · `/blogger` · `/daemon` (log thật + SSE) · `/scanner` (media library + nút **Log**/**Quét ngay**) · `/audit` · `/config` (hiện đường dẫn config + preflight Chrome).
+
+### 8.3 Bảo mật
+- `agent.daemon_api_token` là Bearer token cho webhook → sinh bằng `openssl rand -hex 32`.
+- Không commit `agents/config.json` chứa mật khẩu/API key thật (dùng `${VAR}` + biến môi trường).
+- `GET /api/config` đã mask `database.password` và `imgbb.api_key`; PUT giữ nguyên key nếu gửi rỗng.
+
+---
+
+## 9. Troubleshooting
+
+| Triệu chứng | Nguyên nhân & cách xử lý |
+|---|---|
+| `imgbb HTTP 400 "Can't download remote image"` | `imgbb.upload_format="url"` nhưng WP không public → đổi sang `blob`. |
+| `attachment offload failed ... file missing on disk` | File local đã bị xoá trước đó → bật lại `delete_local_after_offload=false` và upload lại từ WP. |
+| `Chrome/CDP error: DevTools not ready on port 9222` | Chrome đang mở cùng profile → tắt hẳn (Cmd+Q / kill chrome) rồi thử lại; hoặc đổi `remote_debugging_port`. Dùng `/api/chrome/preflight`. |
+| Blogger job `failed` hàng loạt | `blogger.blog_id` chưa đúng (không phải `YOUR_...`), hoặc profile chưa đăng nhập Blogger. |
+| `/scanner` 404 | Đang chạy daemon cũ chưa deploy → copy binary mới + restart service. |
+| `/api/attachments` 500 `ONLY_FULL_GROUP_BY` | Binary cũ → deploy bản mới. |
+| Config lưu nhưng reload mất | Binary cũ (chưa có live config) → deploy bản mới. |
+| `/config` thiếu trường | Bundle UI cũ (cache) → Cmd+Shift+R. |
+| Log trống | Binary cũ chưa có buffer log/DB → deploy bản mới. |
+
+Kiểm tra nhanh:
+```bash
+curl -s localhost:2095/api/health
+curl -s "localhost:2095/api/scan/status"
+curl -s "localhost:2095/api/logs?level=ERROR&limit=10"
 ```
 
 ---
 
-## File Locations Summary
-
-| File | Purpose |
-|------|---------|
-| `agents/daemon/target/release/wp-offload-daemon` | Release binary |
-| `agents/daemon/macos/com.puleeno.wp-offload-daemon.plist` | macOS launchd service |
-| `agents/daemon/linux/wp-offload-daemon.service` | Linux systemd service |
-| `agents/daemon/install.sh` | Cross-platform installer |
-| `agents/config.json` | Daemon configuration |
-| `agents/web-ui/dist/` | Dashboard UI (served by daemon) |
-| `wp-content/plugins/wp-optimization-agents/` | WordPress plugin |
-| `/var/log/wp-offload-daemon/` | Daemon logs (macOS) |
-| `journalctl -u wp-offload-daemon` | Daemon logs (Linux) |
-
----
-
-## Support
-
-- **Issues**: Check logs first (`RUST_LOG=debug` for verbose)
-- **Blogger UI changes**: Update selectors in `agents/daemon/src/blogger.rs`
-- **WP schema changes**: Update `agents/wp-optimization-agents-plugin/src/Database/Schema.php`
-- **Dashboard**: Rebuild with `cd agents/web-ui && npm run build`
+## 10. Tài liệu liên quan
+- `agents/README.md` — tổng quan components
+- `agents/daemon/README.md` — đặc tả daemon/kiến trúc
+- `agents/RELEASE.md` — quy trình release/deploy/rollback
+- `agents/config.example.json` — config mẫu production (dùng `${VAR}`)

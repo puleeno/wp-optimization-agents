@@ -1,5 +1,11 @@
 # WordPress Media Offload Daemon - Complete Agent Specification
 
+> **Setup & vận hành:** xem [../SETUP.md](../SETUP.md) (macOS / Linux / Windows).
+> **Config mẫu portable:** [../config.example.json](../config.example.json) (hỗ trợ `${VAR:-default}`, đường dẫn tương đối, tự dò Chrome theo OS).
+
+**Luồng hiện tại (thay cho mô tả "PyO3 / 1 post = 1 album" ở các mục cũ):**
+`WP webhook → imgbb backup → CDN proxy URL (+ url_versions) → replace URL trong DB → Blogger queue (Chrome CDP) → finish worker crop/resize theo image size → CDN trỏ bản mới nhất theo attachment_id + image_size`; kèm **media scan worker** (tự quét attachment chưa xử lý) và **audit** Chrome headless.
+
 ## Overview
 
 **wp-offload-daemon** is a cross-platform Rust-based daemon service that automates media offloading from WordPress to Google Blogger. The service provides robust Chrome automation, API integration, and image transformation capabilities.
