@@ -158,6 +158,7 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/scan/run", post(run_scan))
         .route("/api/scan/status", get(scan_status))
         .route("/api/chrome/preflight", get(chrome_preflight))
+        .route("/api/blogger/status", get(blogger_status))
         .route("/api/webhooks/media-upload", post(media_upload_webhook))
         .route("/webhook/media-upload", post(media_upload_webhook))
         .route("/cdn/*path", get(cdn_proxy))
@@ -362,8 +363,14 @@ async fn scan_status(State(state): State<AppState>) -> impl IntoResponse {
     let pending = db.count_pending_attachments().await.unwrap_or(0);
     let total = db.count_attachments().await.unwrap_or(0);
     let (queued, uploaded, finished, failed) = db.blogger_queue_counts().await.unwrap_or((0, 0, 0, 0));
+    let skipped = db.count_skipped_attachments().await.unwrap_or(0);
+    let offloaded_sizes = db.count_cdn_mappings().await.unwrap_or(0);
+    let blogger_versions = db.count_blogger_versions().await.unwrap_or(0);
     let cfg = state.config_live.read().await;
     let imgbb_ready = cfg.imgbb.enabled && !cfg.imgbb.api_key.trim().is_empty();
+    let blogger_profile = cfg.chrome.user_data_dir.clone()
+        .unwrap_or_else(|| crate::chrome::default_user_data_dir().to_string_lossy().to_string());
+    let blogger_logged_in = crate::cli::is_login_ok(std::path::Path::new(&blogger_profile));
     Json(serde_json::json!({
         "ok": true,
         "pending": pending,
@@ -373,10 +380,15 @@ async fn scan_status(State(state): State<AppState>) -> impl IntoResponse {
         "scan_interval_secs": cfg.agent.scan_interval_secs,
         "scan_batch_size": cfg.agent.scan_batch_size,
         "finish_workers": cfg.agent.finish_workers,
+        "offloaded_sizes": offloaded_sizes,
+        "skipped": skipped,
+        "blogger_versions": blogger_versions,
         "delete_local_after_offload": cfg.agent.delete_local_after_offload,
         "imgbb_ready": imgbb_ready,
         "imgbb_upload_format": cfg.imgbb.upload_format,
         "blogger_ready": !cfg.blogger.blog_id.trim().is_empty() && !cfg.blogger.blog_id.contains("YOUR_"),
+        "blogger_logged_in": blogger_logged_in,
+        "blogger_profile": blogger_profile,
         "queue": {
             "queued": queued,
             "uploaded": uploaded,
@@ -411,9 +423,29 @@ async fn chrome_preflight(State(state): State<AppState>) -> impl IntoResponse {
         advice.push(format!("Chưa có profile Chrome tại {} (sẽ được tạo khi chạy)", profile_dir));
     }
     if !port_open {
+        let cmd_hint = if cfg!(target_os = "macos") {
+            format!(
+                "open -na \"Google Chrome\" --args --remote-debugging-port={p} --user-data-dir=\"{d}\" --profile-directory={pr}",
+                p = port, d = profile_dir, pr = cfg.chrome.profile_directory
+            )
+        } else if cfg!(target_os = "windows") {
+            format!(
+                "& \"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --remote-debugging-port={p} --user-data-dir=\"{d}\"",
+                p = port, d = profile_dir
+            )
+        } else {
+            format!(
+                "google-chrome --remote-debugging-port={p} --user-data-dir=\"{d}\" &",
+                p = port, d = profile_dir
+            )
+        };
         advice.push(format!(
-            "Port {} chưa mở. Nếu Chrome đang chạy sẵn, hãy tắt hẳn (Cmd+Q) rồi để daemon tự mở, hoặc mở Chrome với --remote-debugging-port={}",
-            port, port
+            "Port {} chưa mở. Chạy: {} (giữ Chrome mở, đăng nhập Blogger sẵn)",
+            port, cmd_hint
+        ));
+        advice.push(format!(
+            "Hoặc tắt hẳn Chrome (Cmd+Q / kill chrome) để daemon tự mở Chrome với profile {}",
+            profile_dir
         ));
     }
     if !cfg.blogger.blog_id.trim().is_empty() && !cfg.blogger.blog_id.contains("YOUR_") {
@@ -436,6 +468,22 @@ async fn chrome_preflight(State(state): State<AppState>) -> impl IntoResponse {
         "headless": cfg.chrome.headless,
         "blogger_id": cfg.blogger.blog_id,
         "advice": advice
+    }))
+}
+
+async fn blogger_status(State(state): State<AppState>) -> impl IntoResponse {
+    let cfg = state.config_live.read().await;
+    let profile = cfg.chrome.user_data_dir.clone()
+        .unwrap_or_else(|| crate::chrome::default_user_data_dir().to_string_lossy().to_string());
+    let profile_path = std::path::PathBuf::from(&profile);
+    let logged_in = crate::cli::is_login_ok(&profile_path);
+    Json(serde_json::json!({
+        "ok": true,
+        "logged_in": logged_in,
+        "profile": profile,
+        "marker": crate::cli::login_marker_info(&profile_path),
+        "blog_id": cfg.blogger.blog_id,
+        "hint": if logged_in { "Blogger đã đăng nhập" } else { "Chạy: wp-offload-daemon chrome login --save" }
     }))
 }
 

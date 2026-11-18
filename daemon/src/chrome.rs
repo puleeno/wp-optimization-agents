@@ -40,6 +40,26 @@ impl Cdp {
         debug_port: u16,
         timeout_secs: u64,
     ) -> Result<Self> {
+        // 1) If a Chrome instance already exposes DevTools on this port, attach to it.
+        //    (Launching a second Chrome with the same profile would fail or steal the profile lock.)
+        let version_url = format!("http://127.0.0.1:{}/json/version", debug_port);
+        if let Ok(resp) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1200))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+            .get(&version_url)
+            .send()
+            .await
+        {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                if let Some(ws) = v.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
+                    tracing::info!(target: "chrome", port = debug_port, "attaching to already-running Chrome");
+                    return Self::connect(ws.to_string(), None).await;
+                }
+            }
+        }
+
+        // 2) Otherwise launch a fresh Chrome with remote debugging.
         std::fs::create_dir_all(user_data_dir).ok();
         let port_file = user_data_dir.join("DevToolsActivePort");
         let _ = std::fs::remove_file(&port_file);
@@ -57,7 +77,12 @@ impl Cdp {
         let child = cmd.spawn().map_err(|e| Error::ChromeError(format!("spawn chrome: {e}")))?;
 
         let ws_url = wait_for_ws_url(&port_file, debug_port, timeout_secs).await?;
-        tracing::info!("connecting CDP {}", ws_url);
+        Self::connect(ws_url, Some(child)).await
+    }
+
+    /// Connect to a Chrome DevTools websocket endpoint and open a new target.
+    async fn connect(ws_url: String, child: Option<std::process::Child>) -> Result<Self> {
+        tracing::info!(target: "chrome", "connecting CDP {}", ws_url);
         let (stream, _) = connect_async(&ws_url).await.map_err(|e| Error::ChromeError(format!("ws connect: {e}")))?;
         let (write, read) = stream.split();
         let pending = Arc::new(Mutex::new(HashMap::<u64, oneshot::Sender<Value>>::new()));
@@ -75,7 +100,7 @@ impl Cdp {
             pending,
             id: browser.id,
             session_id,
-            _child: Mutex::new(Some(child)),
+            _child: Mutex::new(child),
         });
         let cdp = Cdp { inner };
         let _ = cdp.call("Page.enable", json!({})).await;

@@ -8,6 +8,7 @@ import { DaemonEngineTab } from './components/DaemonEngineTab';
 import { WordPressScannerTab } from './components/WordPressScannerTab';
 import { DailyAuditTab } from './components/DailyAuditTab';
 import { ConfigTab } from './components/ConfigTab';
+import { CrawlSourcesTab } from './components/CrawlSourcesTab';
 import {
   DaemonMetrics,
   OffloadImage,
@@ -16,21 +17,27 @@ import {
 } from './types/dashboard';
 
 const TAB_ROUTES: Record<string, string> = {
-  overview: '/',
+  overview: '/overview',
   blogger_lab: '/blogger',
   daemon_engine: '/daemon',
-  wp_scanner: '/scanner',
-  daily_audit: '/audit',
+  crawl_sources: '/crawl',
+  crawl_wp_media: '/crawl/wp-media',
+  crawl_audit: '/crawl/audit',
   config: '/config',
 };
 
 const PATH_TO_TAB: Record<string, string> = {
   '/': 'overview',
+  '/overview': 'overview',
   '/blogger': 'blogger_lab',
   '/daemon': 'daemon_engine',
-  '/scanner': 'wp_scanner',
-  '/audit': 'daily_audit',
+  '/crawl': 'crawl_sources',
+  '/crawl/wp-media': 'crawl_wp_media',
+  '/crawl/audit': 'crawl_audit',
   '/config': 'config',
+  // legacy redirects mapping
+  '/scanner': 'crawl_wp_media',
+  '/audit': 'crawl_audit',
 };
 
 const API_BASE = '/api';
@@ -169,18 +176,20 @@ export default function App() {
     try {
       const needMetrics = activeTab === 'overview' || activeTab === 'daemon_engine';
       const needImages = activeTab === 'blogger_lab';
-      const needAudits = activeTab === 'daily_audit' || activeTab === 'overview';
-      const needTask = activeTab === 'overview' || activeTab === 'daemon_engine';
+      const needAudits = activeTab === 'crawl_audit' || activeTab === 'crawl_sources' || activeTab === 'overview';
+      const needTask = activeTab === 'overview' || activeTab === 'daemon_engine' || activeTab === 'crawl_wp_media' || activeTab === 'crawl_audit';
+      const needScanStatus = activeTab === 'crawl_sources' || activeTab === 'crawl_wp_media';
 
-      const [metricsR, imgsR, auditsR, configR, taskR] = await Promise.all([
+      const [metricsR, imgsR, auditsR, configR, taskR, scanR] = await Promise.all([
         needMetrics ? fetchJson<DaemonMetrics>(`${API_BASE}/metrics`) : Promise.resolve(null),
         needImages ? fetchJson<any[]>(`${API_BASE}/images?limit=100`) : Promise.resolve(null),
         needAudits ? fetchJson<DailyAuditRecord[]>(`${API_BASE}/audits`) : Promise.resolve(null),
         includeConfig ? fetchJson<AgentConfig>(`${API_BASE}/config`) : Promise.resolve(null),
         needTask ? fetchJson<any>(`${API_BASE}/tasks/current`, 6000) : Promise.resolve(null),
+        needScanStatus ? fetchJson<any>(`${API_BASE}/scan/status`, 6000) : Promise.resolve(null),
       ]);
 
-      const results = [metricsR, imgsR, auditsR, configR, taskR].filter(Boolean) as FetchResult<any>[];
+      const results = [metricsR, imgsR, auditsR, configR, taskR, scanR].filter(Boolean) as FetchResult<any>[];
       const hadAny = results.length > 0;
       const allFailed = hadAny && results.every(r => !r.ok);
       if (allFailed) {
@@ -194,6 +203,7 @@ export default function App() {
       if (auditsR?.ok && Array.isArray(auditsR.data)) setDailyAudits(auditsR.data);
       if (configR?.ok && configR.data) applyConfig(configR.data);
       if (taskR?.ok && taskR.data) setCurrentTask(taskR.data.task ?? null);
+      if (scanR?.ok && scanR.data) (window as any).__wpoaScanInfo = scanR.data;
     } catch (e) {
       console.error('Failed to load data:', e);
       listBackoffRef.current = Math.min(listBackoffRef.current * 2, 120000);
@@ -241,7 +251,7 @@ export default function App() {
 
   // Realtime current task: SSE (preferred) with 6s polling fallback
   useEffect(() => {
-    const shouldStream = activeTab === 'overview' || activeTab === 'daemon_engine';
+    const shouldStream = activeTab === 'overview' || activeTab === 'daemon_engine' || activeTab === 'crawl_wp_media' || activeTab === 'crawl_audit';
     let poll: number | undefined;
     const stop = () => {
       if (esRef.current) { esRef.current.close(); esRef.current = null; }
@@ -398,8 +408,9 @@ export default function App() {
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
           <Routes>
+            <Route path="/" element={<Navigate to="/overview" replace />} />
             <Route
-              path="/"
+              path="/overview"
               element={
                 <OverviewTab
                   metrics={daemonMetrics}
@@ -432,7 +443,17 @@ export default function App() {
               }
             />
             <Route
-              path="/scanner"
+              path="/crawl"
+              element={
+                <CrawlSourcesTab
+                  onNavigate={(path) => navigate(path)}
+                  scanInfo={(window as any).__wpoaScanInfo}
+                  auditCount={dailyAudits.length}
+                />
+              }
+            />
+            <Route
+              path="/crawl/wp-media"
               element={
                 <WordPressScannerTab
                   onProcessAttachment={handleProcessAttachment}
@@ -441,7 +462,7 @@ export default function App() {
               }
             />
             <Route
-              path="/audit"
+              path="/crawl/audit"
               element={
                 <DailyAuditTab
                   audits={dailyAudits}
@@ -460,7 +481,10 @@ export default function App() {
                 />
               }
             />
-            <Route path="*" element={<Navigate to="/" replace />} />
+            {/* Legacy route compatibility */}
+            <Route path="/scanner" element={<Navigate to="/crawl/wp-media" replace />} />
+            <Route path="/audit" element={<Navigate to="/crawl/audit" replace />} />
+            <Route path="*" element={<Navigate to="/overview" replace />} />
           </Routes>
         </main>
 

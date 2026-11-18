@@ -183,9 +183,42 @@ Mở `http://localhost:2095`, kiểm tra lần lượt:
 
 ---
 
-## 7. Cài như service
+## 7. Chrome Login CLI (macOS · Linux · Windows)
 
-### 7.1 macOS (launchd)
+Dùng binary daemon để mở Chrome + đăng nhập Blogger một lần, sau đó daemon tái sử dụng profile đó (attach-first, không mở Chrome thứ 2).
+
+```bash
+# Xem trợ giúp
+wp-offload-daemon chrome
+
+# Mở Chrome với profile riêng + port debug, vào trang Blogger
+wp-offload-daemon chrome setup                 # mặc định port 9222, profile ~/.config/wp-opt-agents-chrome
+wp-offload-daemon chrome setup --port 9223 --profile /path/to/profile
+
+# Kiểm tra port debug + trạng thái đăng nhập Blogger
+wp-offload-daemon chrome status
+
+# Chờ tới khi đăng nhập thành công rồi ghi chrome.user_data_dir vào config
+wp-offload-daemon chrome login --save          # --config /path/config.json nếu không đặt DAEMON_CONFIG
+```
+
+**Đặc điểm:**
+- Dùng **profile riêng** (`chrome.user_data_dir` mặc định `~/.config/wp-opt-agents-chrome`; Windows `%LOCALAPPDATA%\wp-opt-agents-chrome`) → không đụng profile Chrome chính, không bị khoá profile.
+- Tự dò Chrome theo OS nếu `chrome.executable` để trống (macOS `Google Chrome`, Linux `google-chrome`/`chromium`, Windows `chrome.exe`); macOS dùng `open -na` để mở đúng GUI session.
+- `--save` chỉ ghi `chrome.user_data_dir` vào `DAEMON_CONFIG` (hoặc `--config`), **không** ghi secret khác.
+- Sau khi login: daemon sẽ **attach vào Chrome đang chạy** nếu port debug đã mở; nếu không, daemon tự mở Chrome với profile này.
+
+**Windows:** chạy trong PowerShell (nếu là service dạng SYSTEM, hãy chạy CLI bằng chính user sẽ dùng Chrome):
+```powershell
+.\wp-offload-daemon.exe chrome setup
+.\wp-offload-daemon.exe chrome login --save --config C:\wp-opt-agents\config.json
+```
+
+---
+
+## 8. Cài như service
+
+### 8.1 macOS (launchd)
 
 ```bash
 cd agents/daemon
@@ -202,7 +235,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.puleeno.wp-offload-da
 # hoặc: sudo launchctl kickstart -k system/com.puleeno.wp-offload-daemon
 ```
 
-### 7.2 Linux (systemd)
+### 8.2 Linux (systemd)
 
 ```bash
 sudo rsync -av agents/ /opt/wp-opt-agents/
@@ -236,7 +269,7 @@ sudo systemctl enable --now wp-offload-daemon
 journalctl -u wp-offload-daemon -f
 ```
 
-### 7.3 Windows
+### 8.3 Windows
 
 Không có `install.sh` cho Windows. Chạy 2 cách:
 
@@ -258,9 +291,9 @@ Lưu ý Windows:
 
 ---
 
-## 8. Vận hành
+## 9. Vận hành
 
-### 8.1 API chính
+### 9.1 API chính
 
 | Endpoint | Mô tả |
 |---|---|
@@ -275,17 +308,17 @@ Lưu ý Windows:
 | `GET /api/logs/stream` · `GET /api/tasks/stream` | SSE realtime log / task |
 | `GET /cdn/*path` | CDN proxy (imgbb → Blogger bản mới nhất) |
 
-### 8.2 Web UI
+### 9.2 Web UI
 - `/` tổng quan · `/blogger` · `/daemon` (log thật + SSE) · `/scanner` (media library + nút **Log**/**Quét ngay**) · `/audit` · `/config` (hiện đường dẫn config + preflight Chrome).
 
-### 8.3 Bảo mật
+### 9.3 Bảo mật
 - `agent.daemon_api_token` là Bearer token cho webhook → sinh bằng `openssl rand -hex 32`.
 - Không commit `agents/config.json` chứa mật khẩu/API key thật (dùng `${VAR}` + biến môi trường).
 - `GET /api/config` đã mask `database.password` và `imgbb.api_key`; PUT giữ nguyên key nếu gửi rỗng.
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Triệu chứng | Nguyên nhân & cách xử lý |
 |---|---|
@@ -308,7 +341,7 @@ curl -s "localhost:2095/api/logs?level=ERROR&limit=10"
 
 ---
 
-## 10. Tài liệu liên quan
+## 11. Tài liệu liên quan
 - `agents/README.md` — tổng quan components
 - `agents/daemon/README.md` — đặc tả daemon/kiến trúc
 - `agents/RELEASE.md` — quy trình release/deploy/rollback

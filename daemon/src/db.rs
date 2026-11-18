@@ -403,6 +403,55 @@ impl Db {
     pub fn cdn_map_table(&self) -> String { self.cfg.t("wp_opt_agents_cdn_map") }
 
     pub fn audits_table(&self) -> String { self.cfg.t("wp_opt_agents_audits") }
+    pub fn skipped_table(&self) -> String { self.cfg.t("wp_opt_agents_skipped") }
+
+    pub async fn ensure_skipped_table(&self) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop(format!(r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                attachment_id BIGINT UNSIGNED NOT NULL,
+                post_id BIGINT UNSIGNED DEFAULT NULL,
+                reason TEXT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (attachment_id),
+                KEY idx_created (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#, self.skipped_table())).await?;
+        Ok(())
+    }
+
+    /// Remember an attachment that cannot be offloaded (e.g. local files already deleted),
+    /// so the auto-scan stops retrying it forever.
+    pub async fn mark_attachment_skipped(&self, attachment_id: i64, post_id: Option<i64>, reason: &str) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        // never mark skipped when the CDN already serves this attachment
+        let existing: Option<(i64,)> = conn
+            .exec_first(
+                format!("SELECT COUNT(*) FROM {} WHERE attachment_id=:aid", self.cdn_map_table()),
+                params!{"aid" => attachment_id},
+            )
+            .await?;
+        if existing.map(|r| r.0).unwrap_or(0) > 0 {
+            return Ok(());
+        }
+        conn.exec_drop(
+            format!(
+                "INSERT INTO {} (attachment_id, post_id, reason) VALUES (:aid,:pid,:reason) \
+                 ON DUPLICATE KEY UPDATE reason=VALUES(reason), post_id=VALUES(post_id)",
+                self.skipped_table()
+            ),
+            params!{"aid" => attachment_id, "pid" => post_id, "reason" => reason},
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn count_skipped_attachments(&self) -> Result<i64> {
+        let mut conn = self.pool.get_conn().await?;
+        let row: Option<(i64,)> = conn
+            .exec_first(format!("SELECT COUNT(*) FROM {}", self.skipped_table()), ())
+            .await?;
+        Ok(row.map(|r| r.0).unwrap_or(0))
+    }
 
     pub async fn ensure_audit_table(&self) -> Result<()> {
         let mut conn = self.pool.get_conn().await?;
@@ -511,6 +560,7 @@ impl Db {
     }
 
     pub async fn ensure_pipeline_tables(&self) -> Result<()> {
+        self.ensure_skipped_table().await?;
         let mut conn = self.pool.get_conn().await?;
         conn.query_drop(format!(r#"
             CREATE TABLE IF NOT EXISTS {} (
@@ -811,6 +861,20 @@ impl Db {
         Ok(())
     }
 
+    /// Re-queue jobs stuck in `processing` (daemon crashed / Chrome hung).
+    pub async fn reset_stale_blogger_jobs(&self, stale_secs: i64) -> Result<u64> {
+        let mut conn = self.pool.get_conn().await?;
+        let sql = format!(
+            "UPDATE {} SET status='queued', last_error=CONCAT('stale processing, reset after ', {}, 's') \
+             WHERE status='processing' AND updated_at < (NOW() - INTERVAL {} SECOND)",
+            self.blogger_queue_table(),
+            stale_secs,
+            stale_secs
+        );
+        conn.exec_drop(sql, ()).await?;
+        Ok(0)
+    }
+
     pub async fn get_queued_blogger_jobs(&self, limit: usize) -> Result<Vec<(i64,i64,Option<i64>,String,String,Option<String>)>> {
         let mut conn = self.pool.get_conn().await?;
         let rows: Vec<Row> = conn.exec(
@@ -858,14 +922,38 @@ impl Db {
                  LEFT JOIN {} i ON i.attachment_id = p.ID \
                  WHERE p.post_type='attachment' AND (p.post_mime_type LIKE 'image/%' OR p.post_mime_type = '') \
                  GROUP BY p.ID \
-                 HAVING COALESCE(SUM(CASE WHEN i.status IN ('replaced','uploaded') THEN 1 ELSE 0 END),0) = 0 \
-                    OR COALESCE(SUM(CASE WHEN i.status='failed' THEN 1 ELSE 0 END),0) > 0 \
+                 HAVING (COALESCE(SUM(CASE WHEN i.status IN ('replaced','uploaded') THEN 1 ELSE 0 END),0) = 0 \
+                    OR COALESCE(SUM(CASE WHEN i.status='failed' THEN 1 ELSE 0 END),0) > 0) \
+                    AND NOT EXISTS (SELECT 1 FROM {} sk WHERE sk.attachment_id = p.ID) \
+                    AND NOT EXISTS (SELECT 1 FROM {} cm WHERE cm.attachment_id = p.ID) \
                  ORDER BY p.ID DESC LIMIT {}",
-                self.posts_table(), self.images_table(), limit.clamp(1, 500)
+                self.posts_table(), self.images_table(), self.skipped_table(), self.cdn_map_table(), limit.clamp(1, 500)
             ),
             (),
         ).await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    pub async fn count_cdn_mappings(&self) -> Result<i64> {
+        let mut conn = self.pool.get_conn().await?;
+        let row: Option<(i64,)> = conn
+            .exec_first(format!("SELECT COUNT(*) FROM {}", self.cdn_map_table()), ())
+            .await?;
+        Ok(row.map(|r| r.0).unwrap_or(0))
+    }
+
+    pub async fn count_blogger_versions(&self) -> Result<i64> {
+        let mut conn = self.pool.get_conn().await?;
+        let row: Option<(i64,)> = conn
+            .exec_first(
+                format!(
+                    "SELECT COUNT(*) FROM {} WHERE provider='blogger'",
+                    self.url_versions_table()
+                ),
+                (),
+            )
+            .await?;
+        Ok(row.map(|r| r.0).unwrap_or(0))
     }
 
     pub async fn blogger_queue_counts(&self) -> Result<(i64, i64, i64, i64)> {
@@ -903,9 +991,11 @@ impl Db {
                  LEFT JOIN {} i ON i.attachment_id = p.ID \
                  WHERE p.post_type='attachment' AND (p.post_mime_type LIKE 'image/%' OR p.post_mime_type = '') \
                  GROUP BY p.ID \
-                 HAVING COALESCE(SUM(CASE WHEN i.status IN ('replaced','uploaded') THEN 1 ELSE 0 END),0) = 0 \
-                    OR COALESCE(SUM(CASE WHEN i.status='failed' THEN 1 ELSE 0 END),0) > 0) t",
-                self.posts_table(), self.images_table()
+                 HAVING (COALESCE(SUM(CASE WHEN i.status IN ('replaced','uploaded') THEN 1 ELSE 0 END),0) = 0 \
+                    OR COALESCE(SUM(CASE WHEN i.status='failed' THEN 1 ELSE 0 END),0) > 0) \
+                    AND NOT EXISTS (SELECT 1 FROM {} sk WHERE sk.attachment_id = p.ID) \
+                    AND NOT EXISTS (SELECT 1 FROM {} cm WHERE cm.attachment_id = p.ID)) t",
+                self.posts_table(), self.images_table(), self.skipped_table(), self.cdn_map_table()
             ),
             (),
         ).await?;
@@ -929,7 +1019,12 @@ impl Db {
                         MAX(COALESCE(agg.offloaded_mappings, 0)) as offloaded_mappings,
                         MAX(COALESCE(agg.replaced_mappings, 0)) as replaced_mappings,
                         MAX(COALESCE(agg.failed_mappings, 0)) as failed_mappings,
-                        MAX(agg.latest_status) as latest_status
+                        MAX(agg.latest_status) as latest_status,
+                        (SELECT COUNT(*) FROM {} bq WHERE bq.attachment_id = p.ID AND bq.status='failed') as queue_failed,
+                        (SELECT COUNT(*) FROM {} bq2 WHERE bq2.attachment_id = p.ID AND bq2.status IN ('queued','processing','uploaded')) as queue_open,
+                        (SELECT COUNT(*) FROM {} vv WHERE vv.attachment_id = p.ID AND vv.provider='blogger') as blogger_versions,
+                        (SELECT COUNT(*) FROM {} cm WHERE cm.attachment_id = p.ID) as cdn_sizes,
+                        (SELECT sk.reason FROM {} sk WHERE sk.attachment_id = p.ID LIMIT 1) as skip_reason
                  FROM {} p
                  LEFT JOIN {} pm ON pm.post_id = p.ID AND pm.meta_key IN ('_wp_attached_file','_wp_attachment_metadata')
                  LEFT JOIN (
@@ -946,7 +1041,14 @@ impl Db {
                  GROUP BY p.ID
                  ORDER BY p.ID DESC
                  LIMIT :lim OFFSET :off",
-                self.posts_table(), self.postmeta_table(), self.images_table()
+                self.blogger_queue_table(),
+                self.blogger_queue_table(),
+                self.url_versions_table(),
+                self.cdn_map_table(),
+                self.skipped_table(),
+                self.posts_table(),
+                self.postmeta_table(),
+                self.images_table()
             ),
             params!{"lim"=> limit as u64, "off"=> offset as u64}
         ).await?;
@@ -983,6 +1085,12 @@ impl Db {
                 "offloadedMappings": r.get::<i64,_>("offloaded_mappings").unwrap_or(0),
                 "replacedMappings": r.get::<i64,_>("replaced_mappings").unwrap_or(0),
                 "failedMappings": r.get::<i64,_>("failed_mappings").unwrap_or(0),
+                "queueFailed": r.get::<i64,_>("queue_failed").unwrap_or(0),
+                "queueOpen": r.get::<i64,_>("queue_open").unwrap_or(0),
+                "bloggerVersions": r.get::<i64,_>("blogger_versions").unwrap_or(0),
+                "cdnSizes": r.get::<i64,_>("cdn_sizes").unwrap_or(0),
+                "skipped": row_opt_string(&r, "skip_reason").is_some(),
+                "skipReason": row_opt_string(&r, "skip_reason"),
                 "latestStatus": r.get::<Option<String>,_>("latest_status").unwrap_or(None),
                 "affectedPostIds": affected,
                 "affectedPostTypes": affected_types,

@@ -6,6 +6,12 @@ use wp_offload_ffi::config::Config;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
 
+    // CLI mode (chrome setup/status/login) — no tracing noise needed
+    if let Some(cli) = wp_offload_ffi::cli::parse() {
+        let code = wp_offload_ffi::cli::run(cli).await;
+        std::process::exit(code);
+    }
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with(tracing_subscriber::fmt::layer())

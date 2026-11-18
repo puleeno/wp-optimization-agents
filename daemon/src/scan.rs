@@ -32,6 +32,8 @@ pub async fn run_media_scan_worker(
             }
         };
         if pending.is_empty() {
+            // nothing left to do — back off until the next interval
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
             continue;
         }
 
@@ -66,9 +68,11 @@ pub async fn run_media_scan_worker(
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        set_task_done(&task, format!("Scan xong {} media", pending.len())).await;
+        let skipped = processor.db.count_skipped_attachments().await.unwrap_or(0);
+        set_task_done(&task, format!("Scan xong {} media (bỏ qua {})", pending.len(), skipped)).await;
 
-        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        // keep going immediately while there is still pending work
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     }
 }
 

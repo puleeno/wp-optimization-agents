@@ -28,7 +28,7 @@
     "launch_timeout_secs": 30,
     "profile_directory": "Default",
     "remote_debugging_port": 9222,
-    "user_data_dir": ""
+    "user_data_dir": "/Users/puleeno/Library/Application Support/Google/Chrome"
   },
   "database": {
     "host": "${DB_HOST:-127.0.0.1}",

@@ -23,6 +23,12 @@ type AttachmentItem = {
   offloadedMappings?: number;
   replacedMappings?: number;
   failedMappings?: number;
+  queueFailed?: number;
+  queueOpen?: number;
+  bloggerVersions?: number;
+  cdnSizes?: number;
+  skipped?: boolean;
+  skipReason?: string | null;
   latestStatus?: string | null;
   affectedPostIds?: number[];
   affectedPostTypes?: string[];
@@ -45,7 +51,7 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
   const [scanInfo, setScanInfo] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'processing' | 'done' | 'failed'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'processing' | 'done' | 'failed' | 'skipped'>('all');
   const [processingId, setProcessingId] = useState<number | null>(null);
   const [batchRunning, setBatchRunning] = useState(false);
 
@@ -77,11 +83,17 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
   const deriveState = (it: AttachmentItem) => {
     const off = Number(it.offloadedMappings || 0);
     const rep = Number(it.replacedMappings || 0);
-    const fail = Number(it.failedMappings || 0);
+    const fail = Number(it.failedMappings || 0) + Number(it.queueFailed || 0);
+    const open = Number(it.queueOpen || 0);
+    const cdn = Number(it.cdnSizes || 0);
+    const blogger = Number(it.bloggerVersions || 0);
     const total = Number(it.totalMappings || 0);
+    if (it.skipped) return 'skipped';
     if (fail > 0) return 'failed';
+    if (blogger > 0 && (total === 0 || blogger >= total)) return 'done';
     if (total > 0 && rep >= total) return 'done';
     if (total > 0 && off > 0) return 'processing';
+    if (cdn > 0 || open > 0) return 'processing';
     return 'pending';
   };
 
@@ -99,15 +111,16 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
   }, [items, searchTerm, statusFilter]);
 
   const counts = useMemo(() => {
-    let pending = 0, processing = 0, done = 0, failed = 0;
+    let pending = 0, processing = 0, done = 0, failed = 0, skipped = 0;
     for (const it of items) {
       const st = deriveState(it);
       if (st === 'pending') pending++;
       else if (st === 'processing') processing++;
       else if (st === 'done') done++;
+      else if (st === 'skipped') skipped++;
       else failed++;
     }
-    return { total: Math.max(total, items.length), pending, processing, done, failed };
+    return { total: Math.max(total, items.length), pending, processing, done, failed, skipped };
   }, [items]);
 
   const processOne = async (id: number) => {
@@ -144,15 +157,15 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
       <div className="p-5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-2 text-xs text-orange-600 dark:text-orange-400 font-mono font-medium">
-            <span>MEDIA LIBRARY SCANNER</span>
+            <span>NGUỒN CRAWL: WP MEDIA</span>
             <span>·</span>
-            <span>ATTACHMENTS / ALL POST TYPES</span>
+            <span>/crawl/wp-media</span>
           </div>
           <h2 className="text-lg font-bold text-slate-900 dark:text-white mt-0.5">
-            Quét thư viện ảnh WordPress (bao gồm sản phẩm WooCommerce, page, custom post type)
+            WordPress Media Library (attachments, mọi post type)
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-3xl">
-            Quét trực tiếp từ <code>wp_posts.post_type=attachment</code> + metadata/sizes. Ảnh được xử lý theo luồng webhook: upload imgbb (backup) → thay URL trong WP sang CDN agent → xóa file vật lý → queue upload Blogger → chuyển CDN sang bản Blogger mới nhất theo <code>image_id + image_size</code>.
+            Nguồn crawl media từ <code>wp_posts.post_type=attachment</code>. Ảnh được offload qua imgbb backup → CDN agent → Blogger/CDN theo mapping <code>image_id + image_size</code>.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -203,9 +216,19 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
           </div>
         </div>
         <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Chờ xử lý</div><div className="text-lg font-bold text-amber-600">{counts.pending}</div></div>
-        <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Đang/đã backup</div><div className="text-lg font-bold text-sky-600">{counts.processing}</div></div>
-        <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Hoàn tất</div><div className="text-lg font-bold text-emerald-600">{counts.done}</div></div>
-        <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Lỗi</div><div className="text-lg font-bold text-rose-600">{counts.failed}</div></div>
+        <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Đang/đã backup</div><div className="text-lg font-bold text-sky-600">{Math.max(counts.processing, scanInfo?.offloaded_sizes ?? 0)}</div>
+          <div className="text-[10px] text-slate-400">CDN map: {(scanInfo?.offloaded_sizes ?? 0).toLocaleString()} size</div></div>
+        <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"><div className="text-slate-400">Hoàn tất (Blogger)</div><div className="text-lg font-bold text-emerald-600">{Math.max(counts.done, scanInfo?.blogger_versions ?? 0)}</div></div>
+        <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div className="text-slate-400">Không xử lý được</div>
+          <div className="text-lg font-bold text-slate-500">{counts.skipped}</div>
+          <div className="text-[10px] text-slate-400">thiếu file gốc (đã bỏ qua)</div>
+        </div>
+        <div className="p-3 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div className="text-slate-400">Lỗi</div>
+          <div className="text-lg font-bold text-rose-600">{counts.failed}</div>
+          <div className="text-[10px] text-slate-400">Blogger queue lỗi: {(scanInfo?.queue?.failed ?? 0).toLocaleString()}</div>
+        </div>
       </div>
 
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -233,6 +256,12 @@ export const WordPressScannerTab: React.FC<WordPressScannerTabProps> = ({
             {!scanInfo.imgbb_ready && <li>imgbb API key chưa cấu hình (vào <b>/config</b> → imgbb backup → nhập API key).</li>}
             {!scanInfo.blogger_ready && <li>Blogger Blog ID chưa cấu hình (vào <b>/config</b> → Blogger → Blog ID).</li>}
             {!scanInfo.scan_enabled && <li>Tự động quét đang tắt (<b>/config</b> → Daemon runtime → bật “Tự động quét”).</li>}
+            {scanInfo.blogger_ready && !scanInfo.blogger_logged_in && (
+              <li>
+                Blogger <b>chưa đăng nhập</b> — queue Blogger đang tạm dừng. Chạy:
+                <code className="font-mono"> wp-offload-daemon chrome login --save</code>
+              </li>
+            )}
           </ul>
           <div className="text-[11px] opacity-80">
             {scanInfo.delete_local_after_offload !== false && (
