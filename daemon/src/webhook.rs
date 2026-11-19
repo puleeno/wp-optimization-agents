@@ -122,6 +122,8 @@ impl WebhookProcessor {
         let mut processed = Vec::new();
         let mut failed_sizes = 0usize;
         let mut missing_local = 0usize;
+        // only files whose imgbb upload (and queueing) succeeded may be deleted later
+        let mut uploaded_local: Vec<String> = Vec::new();
 
         for sz in &all_sizes {
             let local = sz.path.clone().or_else(|| self.url_to_local(&sz.url));
@@ -201,6 +203,9 @@ impl WebhookProcessor {
                 .enqueue_blogger_upload(payload.attachment_id, payload.post_id, &sz.size, &imgbb_url, &local_path)
                 .await?;
             info!(target: "webhook", stage = "queue", provider = "blogger", attachment_id = payload.attachment_id, size = %sz.size, target = %imgbb_url, "queued for blogger upload [{}]", sz.size);
+            if !local_path.is_empty() {
+                uploaded_local.push(local_path.clone());
+            }
             processed.push(serde_json::json!({
                 "size": sz.size,
                 "wp_url": sz.url,
@@ -241,14 +246,17 @@ impl WebhookProcessor {
             Err(e) => warn!(target: "webhook", stage = "replace", provider = "wp_db", attachment_id = payload.attachment_id, "postmeta/options replace failed: {}", e),
         }
 
+        // Safety rule: never delete a local file unless its imgbb upload succeeded.
         let mut deleted = 0usize;
         if self.cfg.agent.delete_local_after_offload {
-            for sz in &all_sizes {
-                if let Some(local_path) = sz.path.clone().or_else(|| self.url_to_local(&sz.url)) {
-                    if std::path::Path::new(&local_path).exists() && std::fs::remove_file(&local_path).is_ok() {
-                        deleted += 1;
-                    }
+            for local_path in &uploaded_local {
+                if std::path::Path::new(local_path).exists() && std::fs::remove_file(local_path).is_ok() {
+                    deleted += 1;
+                    debug!(target: "webhook", stage = "cleanup", provider = "wp_fs", attachment_id = payload.attachment_id, path = %local_path, "đã xoá file local (imgbb upload thành công)");
                 }
+            }
+            if failed_sizes > 0 {
+                info!(target: "webhook", stage = "cleanup", provider = "wp_fs", attachment_id = payload.attachment_id, kept = all_sizes.len().saturating_sub(uploaded_local.len()), "giữ lại file của các size upload lỗi (chưa xoá)");
             }
         } else if !all_sizes.is_empty() {
             info!(target: "webhook", stage = "cleanup", provider = "wp_fs", attachment_id = payload.attachment_id, "delete_local_after_offload=false - local files kept");

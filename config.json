@@ -2,7 +2,7 @@
   "agent": {
     "backup_before_replace": true,
     "daemon_api_token": "8c39ec362bfa709fb4957163b73bb386639a967fe438bcbbc4ed5fc6c386f2d8",
-    "delete_local_after_offload": false,
+    "delete_local_after_offload": true,
     "enable_old_url_redirect_301": true,
     "finish_workers": 4,
     "host": "127.0.0.1",
