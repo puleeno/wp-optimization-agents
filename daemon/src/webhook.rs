@@ -35,6 +35,14 @@ pub struct WebhookProcessor {
     pub db: Db,
     pub cfg: Arc<crate::config::Config>,
     pub imgbb: Option<ImgbbClient>,
+    /// Rate-limit guard for imgbb (shared across scan + webhook threads)
+    imgbb_state: Arc<tokio::sync::Mutex<ImgbbState>>,
+}
+
+#[derive(Default)]
+struct ImgbbState {
+    last_upload: Option<std::time::Instant>,
+    paused_until: Option<std::time::Instant>,
 }
 
 impl WebhookProcessor {
@@ -44,7 +52,43 @@ impl WebhookProcessor {
         } else {
             None
         };
-        Self { db, cfg, imgbb }
+        Self { db, cfg, imgbb, imgbb_state: Arc::new(tokio::sync::Mutex::new(ImgbbState::default())) }
+    }
+
+    /// Serialise imgbb uploads (min 1.2s apart) and honour rate-limit pauses.
+    async fn wait_imgbb_slot(&self) {
+        let mut st = self.imgbb_state.lock().await;
+        if let Some(until) = st.paused_until {
+            let now = std::time::Instant::now();
+            if now < until {
+                tokio::time::sleep(until - now).await;
+            } else {
+                st.paused_until = None;
+            }
+        }
+        if let Some(last) = st.last_upload {
+            let min_gap = std::time::Duration::from_millis(1200);
+            if last.elapsed() < min_gap {
+                tokio::time::sleep(min_gap - last.elapsed()).await;
+            }
+        }
+        st.last_upload = Some(std::time::Instant::now());
+    }
+
+    async fn pause_imgbb(&self, secs: u64) {
+        let mut st = self.imgbb_state.lock().await;
+        st.paused_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+        st.last_upload = None;
+    }
+
+    async fn imgbb_paused(&self) -> bool {
+        let st = self.imgbb_state.lock().await;
+        matches!(st.paused_until, Some(t) if std::time::Instant::now() < t)
+    }
+
+    fn is_rate_limited(err: &str) -> bool {
+        let e = err.to_lowercase();
+        e.contains("rate limit") || e.contains("code\":100") || e.contains("too many")
     }
 
     pub async fn process_media_upload(&self, payload: MediaUploadPayload) -> Result<serde_json::Value> {
@@ -77,6 +121,7 @@ impl WebhookProcessor {
         let mut replacements: Vec<(String, String)> = Vec::new();
         let mut processed = Vec::new();
         let mut failed_sizes = 0usize;
+        let mut missing_local = 0usize;
 
         for sz in &all_sizes {
             let local = sz.path.clone().or_else(|| self.url_to_local(&sz.url));
@@ -85,7 +130,10 @@ impl WebhookProcessor {
                 .filter(|p| std::path::Path::new(p).exists())
                 .map(|p| p.to_string());
             if existing.is_none() {
-                warn!(target: "webhook", stage = "local_path", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %sz.url, "file missing on disk - sẽ thử upload bằng URL");
+                // Expected for attachments whose local files were already removed by an earlier
+                // successful offload. Log once per attachment (aggregated) instead of per size.
+                missing_local += 1;
+                debug!(target: "webhook", stage = "local_path", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %sz.url, "file missing on disk - thử upload bằng URL");
             }
             let local_path = existing.clone().unwrap_or_default();
 
@@ -95,7 +143,8 @@ impl WebhookProcessor {
                 .map(|s| s.to_string())
                 .or_else(|| sz.url.split('/').last().map(|s| s.to_string()));
 
-            info!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %sz.url, mode = if existing.is_some() { self.cfg.imgbb.upload_format.clone() } else { "url".to_string() }, "uploading size to imgbb");
+            info!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %sz.url, mode = if existing.is_some() { self.cfg.imgbb.upload_format.clone() } else { "url".to_string() }, "upload [{}] to imgbb", sz.size);
+            self.wait_imgbb_slot().await;
             let started = std::time::Instant::now();
             let use_blob = existing.is_some()
                 && matches!(self.cfg.imgbb.upload_format.as_str(), "blob" | "binary" | "file");
@@ -116,11 +165,23 @@ impl WebhookProcessor {
 
             let imgbb_url = match imgbb_res {
                 Ok(u) => {
-                    info!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %u, elapsed_ms = started.elapsed().as_millis() as u64, "imgbb upload ok");
+                    info!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %u, elapsed_ms = started.elapsed().as_millis() as u64, "imgbb upload ok [{}]", sz.size);
                     u
                 }
                 Err(e) => {
-                    error!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %sz.url, "imgbb upload failed: {}", e);
+                    let msg = e.to_string();
+                    if Self::is_rate_limited(&msg) {
+                        warn!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, "imgbb rate limit - tạm dừng upload 120s, attachment sẽ thử lại sau");
+                        self.pause_imgbb(120).await;
+                        // defer, don't mark failed/skipped: the scan will pick it up again
+                        return Ok(serde_json::json!({
+                            "ok": true,
+                            "attachment_id": payload.attachment_id,
+                            "status": "rate_limited",
+                            "processed": processed
+                        }));
+                    }
+                    error!(target: "webhook", stage = "imgbb_upload", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %sz.url, "imgbb upload failed: {}", msg);
                     failed_sizes += 1;
                     continue;
                 }
@@ -130,7 +191,7 @@ impl WebhookProcessor {
                 .db
                 .upsert_cdn_mapping(payload.attachment_id, &sz.size, &sz.url, &imgbb_url, "imgbb")
                 .await?;
-            info!(target: "webhook", stage = "cdn_map", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %cdn_url, "cdn mapping -> imgbb (pending blogger)");
+            info!(target: "webhook", stage = "cdn_map", provider = "imgbb", attachment_id = payload.attachment_id, size = %sz.size, target = %cdn_url, "cdn mapping -> imgbb [{}] (pending blogger)", sz.size);
             self.db
                 .insert_url_version(payload.attachment_id, &sz.size, "imgbb", &sz.url, &imgbb_url)
                 .await?;
@@ -139,13 +200,17 @@ impl WebhookProcessor {
             self.db
                 .enqueue_blogger_upload(payload.attachment_id, payload.post_id, &sz.size, &imgbb_url, &local_path)
                 .await?;
-            info!(target: "webhook", stage = "queue", provider = "blogger", attachment_id = payload.attachment_id, size = %sz.size, target = %imgbb_url, "queued for blogger upload");
+            info!(target: "webhook", stage = "queue", provider = "blogger", attachment_id = payload.attachment_id, size = %sz.size, target = %imgbb_url, "queued for blogger upload [{}]", sz.size);
             processed.push(serde_json::json!({
                 "size": sz.size,
                 "wp_url": sz.url,
                 "imgbb_url": imgbb_url,
                 "cdn_url": cdn_url
             }));
+        }
+
+        if missing_local > 0 {
+            warn!(target: "webhook", stage = "local_path", provider = "imgbb", attachment_id = payload.attachment_id, missing = missing_local, "bỏ qua file local (đã bị xoá trước đó) - thử upload bằng URL");
         }
 
         if replacements.is_empty() {
@@ -199,6 +264,58 @@ impl WebhookProcessor {
             "deleted_files": deleted,
             "queued_for_blogger": replacements.len()
         }))
+    }
+
+    pub fn local_path_for_url(&self, url: &str) -> Option<String> {
+        self.url_to_local(url)
+    }
+
+    /// Re-create missing local files from the CDN (imgbb/Blogger) targets recorded earlier.
+    pub async fn restore_missing_local_files(&self, attachment_id: i64, sizes: &[ImageSizePayload]) -> Result<usize> {
+        let mappings = self.db.get_cdn_map_for_attachment(attachment_id).await.unwrap_or_default();
+        if mappings.is_empty() {
+            return Ok(0);
+        }
+        let mut restored = 0usize;
+        for sz in sizes {
+            let Some(local) = sz.path.clone().or_else(|| self.url_to_local(&sz.url)) else {
+                continue;
+            };
+            if std::path::Path::new(&local).exists() {
+                continue;
+            }
+            let Some((_size, _wp, target)) = mappings.iter().find(|(s, _, _)| s == &sz.size) else {
+                continue;
+            };
+            if target.is_empty() {
+                continue;
+            }
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            let downloaded = async {
+                let resp = client.get(target).send().await.map_err(|e| e.to_string())?;
+                resp.bytes().await.map_err(|e| e.to_string())
+            }
+            .await;
+            match downloaded {
+                Ok(bytes) => {
+                    if let Some(parent) = std::path::Path::new(&local).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::fs::write(&local, &bytes) {
+                        Ok(_) => {
+                            restored += 1;
+                            info!(target: "webhook", stage = "restore", provider = "imgbb", attachment_id = attachment_id, size = %sz.size, path = %local, "đã tải lại file local từ CDN");
+                        }
+                        Err(e) => warn!(target: "webhook", stage = "restore", provider = "imgbb", attachment_id = attachment_id, size = %sz.size, path = %local, "ghi file lỗi: {}", e),
+                    }
+                }
+                Err(e) => warn!(target: "webhook", stage = "restore", provider = "imgbb", attachment_id = attachment_id, size = %sz.size, target = %target, "tải lại file lỗi: {}", e),
+            }
+        }
+        Ok(restored)
     }
 
     fn url_to_local(&self, url: &str) -> Option<String> {

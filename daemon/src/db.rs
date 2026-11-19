@@ -650,6 +650,27 @@ impl Db {
                 KEY idx_task (task_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         "#, self.logs_table())).await?;
+
+        // add `size` column for older databases (table name inlined; no user input here)
+        let has_size: Option<(i64,)> = conn
+            .exec_first(
+                format!(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}' AND COLUMN_NAME = 'size'",
+                    self.logs_table()
+                ),
+                (),
+            )
+            .await
+            .unwrap_or(None);
+        if has_size.map(|r| r.0).unwrap_or(0) == 0 {
+            if let Err(e) = conn
+                .query_drop(format!("ALTER TABLE {} ADD COLUMN size VARCHAR(64) NULL", self.logs_table()))
+                .await
+            {
+                tracing::warn!("add logs.size column failed: {}", e);
+            }
+        }
         Ok(())
     }
 
@@ -675,7 +696,7 @@ impl Db {
         if entries.is_empty() { return Ok(()); }
         let mut conn = self.pool.get_conn().await?;
         let sql = format!(
-            "INSERT INTO {} (ts, level, subsystem, message, attachment_id, post_id, task_id, stage, provider, target)              VALUES (:ts,:level,:subsystem,:message,:attachment_id,:post_id,:task_id,:stage,:provider,:target)",
+            "INSERT INTO {} (ts, level, subsystem, message, attachment_id, post_id, task_id, stage, provider, target, size)              VALUES (:ts,:level,:subsystem,:message,:attachment_id,:post_id,:task_id,:stage,:provider,:target,:size)",
             self.logs_table()
         );
         for e in entries {
@@ -693,6 +714,7 @@ impl Db {
                 "stage" => e.stage.clone(),
                 "provider" => e.provider.clone(),
                 "target" => e.target.clone(),
+                "size" => e.size.clone(),
             }).await?;
         }
         Ok(())
@@ -736,7 +758,7 @@ impl Db {
         let rows: Vec<Row> = conn
             .exec(
                 format!(
-                    "SELECT DATE_FORMAT(ts, '%Y-%m-%dT%H:%i:%s.%f') as ts, level, subsystem, message, attachment_id, post_id, task_id, stage, provider, target                      FROM {}{} ORDER BY id DESC LIMIT {} OFFSET {}",
+                    "SELECT DATE_FORMAT(ts, '%Y-%m-%dT%H:%i:%s.%f') as ts, level, subsystem, message, attachment_id, post_id, task_id, stage, provider, target, size                      FROM {}{} ORDER BY id DESC LIMIT {} OFFSET {}",
                     self.logs_table(), where_sql, limit, offset
                 ),
                 (),
@@ -756,6 +778,7 @@ impl Db {
                 stage: row_opt_string(&r, "stage"),
                 provider: row_opt_string(&r, "provider"),
                 target: row_opt_string(&r, "target"),
+                size: row_opt_string(&r, "size"),
             })
             .collect();
         Ok((out, total))
@@ -1144,6 +1167,41 @@ impl Db {
     }
 
     /// width/height/crop of a registered WP image size, from `_wp_attachment_metadata`.
+    /// All CDN mappings for an attachment: (image_size, wp_url, target_url)
+    pub async fn get_cdn_map_for_attachment(&self, attachment_id: i64) -> Result<Vec<(String, String, String)>> {
+        let mut conn = self.pool.get_conn().await?;
+        let rows: Vec<Row> = conn
+            .exec(
+                format!(
+                    "SELECT image_size, wp_url, target_url FROM {} WHERE attachment_id=:aid",
+                    self.cdn_map_table()
+                ),
+                params!{"aid" => attachment_id},
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    row_opt_string(&r, "image_size").unwrap_or_default(),
+                    row_opt_string(&r, "wp_url").unwrap_or_default(),
+                    row_opt_string(&r, "target_url").unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Delete the skip marker so the attachment is picked up again by the auto-scan.
+    pub async fn clear_skipped(&self, attachment_id: i64) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop(
+            format!("DELETE FROM {} WHERE attachment_id=:aid", self.skipped_table()),
+            params!{"aid" => attachment_id},
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_size_spec(&self, attachment_id: i64, size: &str) -> Result<Option<(u32, u32, bool)>> {
         let mut conn = self.pool.get_conn().await?;
         let row: Option<Row> = conn

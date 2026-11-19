@@ -155,6 +155,7 @@ pub fn create_router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/tasks/stream", get(get_current_task_stream))
         .route("/api/posts/:id/process", post(process_post))
         .route("/api/attachments/:id/process", post(process_attachment))
+        .route("/api/attachments/:id/restore", post(restore_attachment))
         .route("/api/scan/run", post(run_scan))
         .route("/api/scan/status", get(scan_status))
         .route("/api/chrome/preflight", get(chrome_preflight))
@@ -332,6 +333,33 @@ async fn process_attachment(State(state): State<AppState>, Path(id): Path<i64>) 
         }
     };
     res
+}
+
+async fn restore_attachment(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    let Some(webhook) = state.webhook.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok": false, "error": "webhook processor not ready"}))).into_response();
+    };
+    let Some(db) = state.db.as_ref().cloned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok": false, "error": "db not ready"}))).into_response();
+    };
+
+    let payload = match db.get_attachment_payload(id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok": false, "error": "attachment not found"}))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
+    };
+
+    let restored = webhook.restore_missing_local_files(id, &payload.sizes).await.unwrap_or(0);
+    let _ = db.clear_skipped(id).await;
+
+    let mut result = serde_json::json!({"ok": true, "attachment_id": id, "restored": restored});
+    if restored > 0 {
+        match webhook.process_media_upload(payload).await {
+            Ok(v) => result = serde_json::json!({"ok": true, "attachment_id": id, "restored": restored, "result": v}),
+            Err(e) => result = serde_json::json!({"ok": false, "attachment_id": id, "restored": restored, "error": e.to_string()}),
+        }
+    }
+    (StatusCode::OK, Json(result)).into_response()
 }
 
 #[derive(Deserialize)]

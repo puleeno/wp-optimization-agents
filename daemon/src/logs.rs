@@ -26,6 +26,8 @@ pub struct LogEntry {
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
 }
 
 impl LogEntry {
@@ -41,6 +43,7 @@ impl LogEntry {
             stage: None,
             provider: None,
             target: None,
+            size: None,
         }
     }
 }
@@ -115,6 +118,7 @@ where
                 .find(|(name, _)| name.eq_ignore_ascii_case(k))
                 .map(|(_, v)| v.clone())
         };
+        let _ = &fields;
         let get_i64 = |k: &str| -> Option<i64> { get(k).and_then(|v| v.parse::<i64>().ok()) };
 
         let entry = LogEntry {
@@ -128,6 +132,7 @@ where
             stage: get("stage"),
             provider: get("provider"),
             target: get("target").or_else(|| get("url")).or_else(|| get("path")),
+            size: get("size").or_else(|| get("image_size")),
         };
         push(entry);
     }
